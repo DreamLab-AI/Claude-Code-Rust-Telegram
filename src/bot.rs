@@ -282,7 +282,9 @@ pub fn is_kill_command(text: &str) -> bool {
 pub fn parse_cc_command(text: &str) -> Option<String> {
     let lower = text.to_lowercase();
     if lower.starts_with("cc ") {
-        Some(format!("/{}", text[3..].trim()))
+        // UTF-8 safe: skip 3 chars (not bytes) to avoid panicking on multi-byte input
+        let rest: String = text.chars().skip(3).collect();
+        Some(format!("/{}", rest.trim()))
     } else {
         None
     }

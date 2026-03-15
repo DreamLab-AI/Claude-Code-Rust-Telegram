@@ -176,12 +176,29 @@ impl InputInjector {
             None => return Ok(false),
         };
 
-        // Send command text (without -l, so tmux interprets special keys)
+        // Validate command matches safe pattern: /word (alphanumeric + hyphens only)
+        let cmd_body = command.strip_prefix('/').unwrap_or(command);
+        if !cmd_body
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == ' ')
+        {
+            tracing::warn!(
+                command,
+                "Slash command rejected: contains unsafe characters"
+            );
+            return Ok(false);
+        }
+
+        // Send command text with -l (literal mode) to prevent tmux key interpretation
         let mut cmd = Command::new("tmux");
         if let Some(socket) = &self.tmux_socket {
             cmd.arg("-S").arg(socket);
         }
-        cmd.arg("send-keys").arg("-t").arg(target).arg(command);
+        cmd.arg("send-keys")
+            .arg("-t")
+            .arg(target)
+            .arg("-l")
+            .arg(command);
 
         let output = cmd.output()?;
         if !output.status.success() {

@@ -11,9 +11,9 @@ use tokio::net::UnixStream;
 /// It reads JSON from stdin, forwards to the bridge daemon via unix socket,
 /// and optionally returns hookSpecificOutput to Claude Code on stdout.
 pub async fn process_hook(socket_path: &std::path::Path) -> Result<()> {
-    // Read all of stdin
+    // Read stdin with 1 MB limit to prevent unbounded memory allocation
     let mut input = String::new();
-    io::stdin().read_to_string(&mut input)?;
+    io::stdin().take(1_048_576).read_to_string(&mut input)?;
 
     let input = input.trim();
     if input.is_empty() {

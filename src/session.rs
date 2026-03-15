@@ -403,7 +403,10 @@ impl SessionManager {
 fn parse_datetime(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+        .unwrap_or_else(|e| {
+            tracing::warn!(input = %s, error = %e, "Failed to parse datetime, falling back to now");
+            Utc::now()
+        })
 }
 
 #[cfg(test)]
