@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::types::{BridgeMessage, HookEvent, HookOutput, HookSpecificOutput, MessageType};
+use crate::types::{BridgeMessage, HookEvent, MessageType};
 use chrono::Utc;
 use std::io::{self, Read, Write};
 use tokio::io::AsyncWriteExt;
@@ -90,7 +90,10 @@ fn event_to_bridge_messages(
         } => {
             let input_json = serde_json::to_value(tool_input).unwrap_or_default();
             let mut metadata = serde_json::Map::new();
-            metadata.insert("tool".to_string(), serde_json::Value::String(tool_name.clone()));
+            metadata.insert(
+                "tool".to_string(),
+                serde_json::Value::String(tool_name.clone()),
+            );
             metadata.insert("input".to_string(), input_json);
 
             // Add tmux info if available
@@ -116,7 +119,10 @@ fn event_to_bridge_messages(
             }
 
             let mut metadata = serde_json::Map::new();
-            metadata.insert("tool".to_string(), serde_json::Value::String(tool_name.clone()));
+            metadata.insert(
+                "tool".to_string(),
+                serde_json::Value::String(tool_name.clone()),
+            );
             add_tmux_metadata(&mut metadata);
 
             vec![BridgeMessage {
@@ -257,9 +263,6 @@ fn add_tmux_metadata(metadata: &mut serde_json::Map<String, serde_json::Value>) 
     // Add hostname
     let hostname = crate::injector::get_hostname();
     if !hostname.is_empty() {
-        metadata.insert(
-            "hostname".to_string(),
-            serde_json::Value::String(hostname),
-        );
+        metadata.insert("hostname".to_string(), serde_json::Value::String(hostname));
     }
 }

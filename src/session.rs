@@ -1,10 +1,10 @@
-use crate::error::{AppError, Result};
+use crate::error::Result;
 use crate::types::{ApprovalStatus, PendingApproval, Session, SessionStatus};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use uuid::Uuid;
 
 pub struct SessionManager {
@@ -133,7 +133,7 @@ impl SessionManager {
             .query_row(
                 "SELECT * FROM sessions WHERE id = ?1",
                 params![session_id],
-                |row| Self::row_to_session(row),
+                Self::row_to_session,
             )
             .ok()
     }
@@ -143,16 +143,17 @@ impl SessionManager {
             .query_row(
                 "SELECT * FROM sessions WHERE thread_id = ?1 AND status = 'active' LIMIT 1",
                 params![thread_id],
-                |row| Self::row_to_session(row),
+                Self::row_to_session,
             )
             .ok()
     }
 
+    #[allow(dead_code)]
     pub fn get_active_sessions(&self) -> Vec<Session> {
         self.db
             .prepare("SELECT * FROM sessions WHERE status = 'active' ORDER BY last_activity DESC")
             .and_then(|mut stmt| {
-                let rows = stmt.query_map([], |row| Self::row_to_session(row))?;
+                let rows = stmt.query_map([], Self::row_to_session)?;
                 Ok(rows.filter_map(|r| r.ok()).collect())
             })
             .unwrap_or_default()
@@ -335,19 +336,25 @@ impl SessionManager {
             .unwrap_or_default()
     }
 
+    #[allow(dead_code)]
     pub fn get_orphaned_thread_sessions(&self) -> Vec<Session> {
         self.db
             .prepare(
                 "SELECT * FROM sessions WHERE status = 'ended' AND thread_id IS NOT NULL ORDER BY last_activity ASC",
             )
             .and_then(|mut stmt| {
-                let rows = stmt.query_map([], |row| Self::row_to_session(row))?;
+                let rows = stmt.query_map([], Self::row_to_session)?;
                 Ok(rows.filter_map(|r| r.ok()).collect())
             })
             .unwrap_or_default()
     }
 
-    pub fn is_tmux_target_owned_by_other(&self, tmux_target: &str, exclude_session_id: &str) -> bool {
+    #[allow(dead_code)]
+    pub fn is_tmux_target_owned_by_other(
+        &self,
+        tmux_target: &str,
+        exclude_session_id: &str,
+    ) -> bool {
         self.db
             .query_row(
                 "SELECT id FROM sessions WHERE tmux_target = ?1 AND status = 'active' AND id != ?2 LIMIT 1",

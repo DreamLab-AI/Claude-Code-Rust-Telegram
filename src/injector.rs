@@ -27,6 +27,7 @@ impl InputInjector {
     }
 
     /// Get current tmux target
+    #[allow(dead_code)]
     pub fn target(&self) -> Option<&str> {
         self.tmux_target.as_deref()
     }
@@ -209,9 +210,7 @@ impl InputInjector {
             cmd.arg("-S").arg(s);
         }
         cmd.arg("list-panes").arg("-t").arg(target);
-        cmd.output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        cmd.output().map(|o| o.status.success()).unwrap_or(false)
     }
 
     /// Detect current tmux session from environment
@@ -275,6 +274,7 @@ impl InputInjector {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TmuxInfo {
     pub session: String,
     pub pane: String,

@@ -8,7 +8,7 @@ use crate::socket::SocketServer;
 use crate::types::{BridgeMessage, InlineButton, MessageType, SendOptions};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::time::{self, Duration};
 
 /// Central bridge daemon coordinating all components
@@ -224,7 +224,12 @@ impl BridgeShared {
             }
             MessageType::TurnComplete => {
                 tracing::debug!(session_id = %msg.session_id, "Turn complete");
-                if self.compacting_sessions.read().await.contains(&msg.session_id) {
+                if self
+                    .compacting_sessions
+                    .read()
+                    .await
+                    .contains(&msg.session_id)
+                {
                     self.handle_compact_complete(&msg.session_id).await;
                 }
             }
@@ -278,11 +283,8 @@ impl BridgeShared {
                 .await
                 .insert(session_id.clone(), tid as i32);
         } else if self.config.use_threads {
-            let topic_name = format_topic_name(
-                &session_id,
-                hostname.as_deref(),
-                project_dir.as_deref(),
-            );
+            let topic_name =
+                format_topic_name(&session_id, hostname.as_deref(), project_dir.as_deref());
             if let Ok(Some(tid)) = self.bot.create_forum_topic(&topic_name).await {
                 let sessions = self.sessions.lock().await;
                 sessions.set_session_thread(&session_id, tid as i64);
@@ -309,11 +311,7 @@ impl BridgeShared {
 
         let _ = self
             .bot
-            .send_message(
-                &info,
-                &SendOptions::default(),
-                thread_id.map(|t| t as i32),
-            )
+            .send_message(&info, &SendOptions::default(), thread_id.map(|t| t as i32))
             .await;
 
         Ok(())
@@ -326,7 +324,9 @@ impl BridgeShared {
         };
 
         if let Some(session) = session {
-            let duration = (chrono::Utc::now() - session.started_at).num_milliseconds().max(0) as u64;
+            let duration = (chrono::Utc::now() - session.started_at)
+                .num_milliseconds()
+                .max(0) as u64;
             let thread_id = self.get_session_thread_id(&msg.session_id).await;
 
             let _ = self
@@ -407,7 +407,11 @@ impl BridgeShared {
         let preview = build_tool_preview(&tool_name, tool_input.as_ref());
 
         // Cache tool input for details button
-        let tool_use_id = format!("tool_{}_{}", chrono::Utc::now().timestamp_millis(), uuid::Uuid::new_v4().simple());
+        let tool_use_id = format!(
+            "tool_{}_{}",
+            chrono::Utc::now().timestamp_millis(),
+            uuid::Uuid::new_v4().simple()
+        );
         if let Some(input) = &tool_input {
             self.tool_input_cache.write().await.insert(
                 tool_use_id.clone(),
@@ -463,7 +467,12 @@ impl BridgeShared {
         let _ = self
             .bot
             .send_message(
-                &formatting::format_tool_execution(tool_name, None, &msg.content, self.config.verbose),
+                &formatting::format_tool_execution(
+                    tool_name,
+                    None,
+                    &msg.content,
+                    self.config.verbose,
+                ),
                 &SendOptions::default(),
                 thread_id,
             )
@@ -614,11 +623,7 @@ impl BridgeShared {
         }
     }
 
-    async fn handle_telegram_command(
-        &self,
-        msg: &teloxide::types::Message,
-        text: &str,
-    ) {
+    async fn handle_telegram_command(&self, msg: &teloxide::types::Message, text: &str) {
         let thread_id = msg.thread_id.map(|t| t.0 .0);
         let cmd = text.split_whitespace().next().unwrap_or("");
 
@@ -665,11 +670,7 @@ impl BridgeShared {
             "/ping" => {
                 let _ = self
                     .bot
-                    .send_message(
-                        "\u{1f3d3} Pong!",
-                        &SendOptions::default(),
-                        thread_id,
-                    )
+                    .send_message("\u{1f3d3} Pong!", &SendOptions::default(), thread_id)
                     .await;
             }
             _ => {
@@ -678,11 +679,7 @@ impl BridgeShared {
         }
     }
 
-    async fn handle_telegram_message(
-        &self,
-        msg: &teloxide::types::Message,
-        text: &str,
-    ) {
+    async fn handle_telegram_message(&self, msg: &teloxide::types::Message, text: &str) {
         let thread_id = msg.thread_id.map(|t| t.0 .0);
 
         // Ignore messages in General topic (no thread_id)
@@ -703,7 +700,12 @@ impl BridgeShared {
         };
 
         // Resolve tmux target BEFORE acquiring injector lock (prevent deadlock)
-        let tmux_target = self.session_tmux_targets.read().await.get(&session.id).cloned();
+        let tmux_target = self
+            .session_tmux_targets
+            .read()
+            .await
+            .get(&session.id)
+            .cloned();
         let (resolved_target, resolved_socket) = if let Some(target) = tmux_target {
             (Some(target), session.tmux_socket.clone())
         } else {
@@ -730,7 +732,10 @@ impl BridgeShared {
         // Check for cc command prefix
         if let Some(command) = bot::parse_cc_command(text) {
             let input_key = format!("{}:{}", session.id, command);
-            self.recent_telegram_inputs.write().await.insert(input_key.clone());
+            self.recent_telegram_inputs
+                .write()
+                .await
+                .insert(input_key.clone());
             let inputs = self.recent_telegram_inputs.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(10)).await;
@@ -772,7 +777,10 @@ impl BridgeShared {
 
         // Track to prevent echo
         let input_key = format!("{}:{}", session.id, text.trim());
-        self.recent_telegram_inputs.write().await.insert(input_key.clone());
+        self.recent_telegram_inputs
+            .write()
+            .await
+            .insert(input_key.clone());
         let inputs = self.recent_telegram_inputs.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -845,11 +853,12 @@ impl BridgeShared {
                 // Edit the original message
                 if let Some(msg) = &query.message {
                     let msg_id = msg.id().0;
-                    let original_text = if let teloxide::types::MaybeInaccessibleMessage::Regular(m) = msg {
-                        m.text().unwrap_or("").to_string()
-                    } else {
-                        String::new()
-                    };
+                    let original_text =
+                        if let teloxide::types::MaybeInaccessibleMessage::Regular(m) = msg {
+                            m.text().unwrap_or("").to_string()
+                        } else {
+                            String::new()
+                        };
                     let _ = self
                         .bot
                         .edit_message_text(
@@ -864,18 +873,16 @@ impl BridgeShared {
             "tooldetails" => {
                 let cache = self.tool_input_cache.read().await;
                 if let Some(cached) = cache.get(id) {
-                    let details = formatting::format_tool_details(
-                        &cached.tool,
-                        &cached.input,
-                    );
+                    let details = formatting::format_tool_details(&cached.tool, &cached.input);
 
                     // Reply with details
                     if let Some(msg) = &query.message {
-                        let thread_id = if let teloxide::types::MaybeInaccessibleMessage::Regular(m) = msg {
-                            m.thread_id.map(|t| t.0 .0)
-                        } else {
-                            None
-                        };
+                        let thread_id =
+                            if let teloxide::types::MaybeInaccessibleMessage::Regular(m) = msg {
+                                m.thread_id.map(|t| t.0 .0)
+                            } else {
+                                None
+                            };
                         let _ = self
                             .bot
                             .send_message(&details, &SendOptions::default(), thread_id)
@@ -984,11 +991,7 @@ impl BridgeShared {
             .insert(msg.session_id.clone(), new_target.clone());
 
         let sessions = self.sessions.lock().await;
-        sessions.set_tmux_info(
-            &msg.session_id,
-            Some(&new_target),
-            new_socket,
-        );
+        sessions.set_tmux_info(&msg.session_id, Some(&new_target), new_socket);
     }
 
     async fn cleanup_stale_sessions(&self) {
@@ -1003,15 +1006,18 @@ impl BridgeShared {
             if session.tmux_target.is_none() {
                 // No tmux info, clean up after 1h
                 tracing::info!(session_id = %session.id, "Cleaning up stale session (no tmux, >1h)");
-                self.cleanup_stale_session(&session, "inactivity timeout").await;
+                self.cleanup_stale_session(&session, "inactivity timeout")
+                    .await;
             } else if let Some(target) = &session.tmux_target {
                 // Check if 24h+ old AND pane is dead
                 let age_hours = (chrono::Utc::now() - session.last_activity).num_hours();
                 if age_hours >= 24 {
-                    let pane_alive = InputInjector::is_pane_alive(target, session.tmux_socket.as_deref());
+                    let pane_alive =
+                        InputInjector::is_pane_alive(target, session.tmux_socket.as_deref());
                     if !pane_alive {
                         tracing::info!(session_id = %session.id, "Cleaning up stale session (pane dead)");
-                        self.cleanup_stale_session(&session, "pane no longer exists").await;
+                        self.cleanup_stale_session(&session, "pane no longer exists")
+                            .await;
                     }
                 }
             }
@@ -1052,7 +1058,11 @@ impl BridgeShared {
 }
 
 /// Format topic name for a session
-fn format_topic_name(session_id: &str, hostname: Option<&str>, project_dir: Option<&str>) -> String {
+fn format_topic_name(
+    session_id: &str,
+    hostname: Option<&str>,
+    project_dir: Option<&str>,
+) -> String {
     let mut parts = Vec::new();
 
     if let Some(host) = hostname {
@@ -1087,40 +1097,35 @@ fn build_tool_preview(tool_name: &str, input: Option<&serde_json::Value>) -> Str
     let obj = input.as_object();
 
     match tool_name {
-        "Read" | "Write" | "Edit" => {
-            obj.and_then(|o| o.get("file_path"))
-                .and_then(|v| v.as_str())
-                .map(|p| format!(" `{}`", formatting::truncate_path(p)))
-                .unwrap_or_default()
-        }
-        "Bash" => {
-            obj.and_then(|o| o.get("command"))
-                .and_then(|v| v.as_str())
-                .map(|c| {
-                    let short: String = c.chars().take(50).collect();
-                    let ellipsis = if c.len() > 50 { "..." } else { "" };
-                    format!("\n`{}{}`", short, ellipsis)
-                })
-                .unwrap_or_default()
-        }
-        "Grep" => {
-            obj.and_then(|o| o.get("pattern"))
-                .and_then(|v| v.as_str())
-                .map(|p| format!(" `{}`", p))
-                .unwrap_or_default()
-        }
-        "Glob" => {
-            obj.and_then(|o| o.get("pattern"))
-                .and_then(|v| v.as_str())
-                .map(|p| format!(" `{}`", p))
-                .unwrap_or_default()
-        }
-        "Task" => {
-            obj.and_then(|o| o.get("description"))
-                .and_then(|v| v.as_str())
-                .map(|d| format!(" {}", d))
-                .unwrap_or_default()
-        }
+        "Read" | "Write" | "Edit" => obj
+            .and_then(|o| o.get("file_path"))
+            .and_then(|v| v.as_str())
+            .map(|p| format!(" `{}`", formatting::truncate_path(p)))
+            .unwrap_or_default(),
+        "Bash" => obj
+            .and_then(|o| o.get("command"))
+            .and_then(|v| v.as_str())
+            .map(|c| {
+                let short: String = c.chars().take(50).collect();
+                let ellipsis = if c.len() > 50 { "..." } else { "" };
+                format!("\n`{}{}`", short, ellipsis)
+            })
+            .unwrap_or_default(),
+        "Grep" => obj
+            .and_then(|o| o.get("pattern"))
+            .and_then(|v| v.as_str())
+            .map(|p| format!(" `{}`", p))
+            .unwrap_or_default(),
+        "Glob" => obj
+            .and_then(|o| o.get("pattern"))
+            .and_then(|v| v.as_str())
+            .map(|p| format!(" `{}`", p))
+            .unwrap_or_default(),
+        "Task" => obj
+            .and_then(|o| o.get("description"))
+            .and_then(|v| v.as_str())
+            .map(|d| format!(" {}", d))
+            .unwrap_or_default(),
         _ => String::new(),
     }
 }

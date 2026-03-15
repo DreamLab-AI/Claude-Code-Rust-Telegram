@@ -1,9 +1,8 @@
 use crate::error::{AppError, Result};
 use crate::types::BridgeMessage;
-use nix::fcntl::{flock, FlockArg};
+use nix::fcntl::{Flock, FlockArg};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -13,7 +12,7 @@ use tokio::sync::{broadcast, mpsc};
 pub struct SocketServer {
     socket_path: PathBuf,
     pid_path: PathBuf,
-    pid_file: Option<fs::File>,
+    pid_lock: Option<Flock<fs::File>>,
 }
 
 impl SocketServer {
@@ -22,7 +21,7 @@ impl SocketServer {
         Self {
             socket_path,
             pid_path,
-            pid_file: None,
+            pid_lock: None,
         }
     }
 
@@ -48,26 +47,38 @@ impl SocketServer {
         fs::set_permissions(&self.pid_path, fs::Permissions::from_mode(0o600))?;
 
         // flock(2): atomic advisory lock, no TOCTOU race
-        match flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
-            Ok(()) => {
-                // Write our PID
-                let mut file_clone = file.try_clone()?;
-                file_clone.set_len(0)?;
-                write!(file_clone, "{}", std::process::id())?;
-                self.pid_file = Some(file);
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(mut locked_file) => {
+                // Write our PID using std::io traits on the locked file
+                use std::io::{Seek, SeekFrom};
+                locked_file
+                    .set_len(0)
+                    .map_err(|e| AppError::Lock(format!("truncate: {}", e)))?;
+                locked_file
+                    .seek(SeekFrom::Start(0))
+                    .map_err(|e| AppError::Lock(format!("seek: {}", e)))?;
+                write!(locked_file, "{}", std::process::id())
+                    .map_err(|e| AppError::Lock(format!("write pid: {}", e)))?;
+                self.pid_lock = Some(locked_file);
                 tracing::debug!(pid = std::process::id(), "PID lock acquired via flock");
                 Ok(())
             }
-            Err(nix::errno::Errno::EWOULDBLOCK) => Err(AppError::Lock(
-                "Another daemon instance is already running (flock held)".to_string(),
-            )),
-            Err(e) => Err(AppError::Lock(format!("flock failed: {}", e))),
+            Err(e) => {
+                let errno = e.1;
+                if errno == nix::errno::Errno::EWOULDBLOCK {
+                    Err(AppError::Lock(
+                        "Another daemon instance is already running (flock held)".to_string(),
+                    ))
+                } else {
+                    Err(AppError::Lock(format!("flock failed: {}", errno)))
+                }
+            }
         }
     }
 
     /// Release PID lock (flock is auto-released when file descriptor closes)
     fn release_pid_lock(&mut self) {
-        self.pid_file.take(); // Drop the file, releasing the flock
+        self.pid_lock.take(); // Drop the Flock, releasing the lock
         let _ = fs::remove_file(&self.pid_path);
         tracing::debug!("PID lock released");
     }
@@ -148,9 +159,7 @@ impl SocketServer {
                         let tx = msg_tx.clone();
                         let btx = broadcast_tx_clone.clone();
                         tokio::spawn(async move {
-                            if let Err(e) =
-                                handle_client_connection(stream, tx, btx).await
-                            {
+                            if let Err(e) = handle_client_connection(stream, tx, btx).await {
                                 tracing::debug!("Client connection ended: {}", e);
                             }
                         });

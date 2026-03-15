@@ -8,12 +8,17 @@ use teloxide::types::{
     ChatId, InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode, ThreadId,
 };
 
-
 /// Telegram Bot wrapper with rate limiting and forum topic support
 pub struct TelegramBot {
     bot: Bot,
     chat_id: ChatId,
-    rate_limiter: Arc<RateLimiter<governor::state::NotKeyed, governor::state::InMemoryState, governor::clock::DefaultClock>>,
+    rate_limiter: Arc<
+        RateLimiter<
+            governor::state::NotKeyed,
+            governor::state::InMemoryState,
+            governor::clock::DefaultClock,
+        >,
+    >,
 }
 
 impl TelegramBot {
@@ -31,11 +36,13 @@ impl TelegramBot {
     }
 
     /// Get a clone of the underlying Bot for polling
+    #[allow(dead_code)]
     pub fn bot(&self) -> Bot {
         self.bot.clone()
     }
 
     /// Get the chat ID
+    #[allow(dead_code)]
     pub fn chat_id(&self) -> ChatId {
         self.chat_id
     }
@@ -56,7 +63,7 @@ impl TelegramBot {
             req = req.parse_mode(match pm.as_str() {
                 "MarkdownV2" => ParseMode::MarkdownV2,
                 "HTML" => ParseMode::Html,
-                _ => ParseMode::Markdown,
+                _ => ParseMode::MarkdownV2,
             });
         }
 
@@ -64,8 +71,7 @@ impl TelegramBot {
             req = req.message_thread_id(ThreadId(MessageId(tid)));
         }
 
-        req.await
-            .map_err(|e| AppError::Telegram(e.to_string()))
+        req.await.map_err(|e| AppError::Telegram(e.to_string()))
     }
 
     /// Send a message with inline keyboard buttons
@@ -101,7 +107,7 @@ impl TelegramBot {
             req = req.parse_mode(match pm.as_str() {
                 "MarkdownV2" => ParseMode::MarkdownV2,
                 "HTML" => ParseMode::Html,
-                _ => ParseMode::Markdown,
+                _ => ParseMode::MarkdownV2,
             });
         }
 
@@ -109,15 +115,18 @@ impl TelegramBot {
             req = req.message_thread_id(ThreadId(MessageId(tid)));
         }
 
-        req.await
-            .map_err(|e| AppError::Telegram(e.to_string()))
+        req.await.map_err(|e| AppError::Telegram(e.to_string()))
     }
 
     /// Create a forum topic
     pub async fn create_forum_topic(&self, name: &str) -> Result<Option<i32>> {
         self.rate_limiter.until_ready().await;
 
-        match self.bot.create_forum_topic(self.chat_id, name, 0x6FB9F0, "").await {
+        match self
+            .bot
+            .create_forum_topic(self.chat_id, name, 0x6FB9F0, "")
+            .await
+        {
             Ok(topic) => {
                 let thread_id = topic.thread_id.0 .0;
                 tracing::info!(%name, %thread_id, "Forum topic created");
@@ -201,8 +210,7 @@ impl TelegramBot {
             req = req.parse_mode(pm);
         }
 
-        req.await
-            .map_err(|e| AppError::Telegram(e.to_string()))?;
+        req.await.map_err(|e| AppError::Telegram(e.to_string()))?;
         Ok(())
     }
 
@@ -215,8 +223,7 @@ impl TelegramBot {
             req = req.text(t);
         }
 
-        req.await
-            .map_err(|e| AppError::Telegram(e.to_string()))?;
+        req.await.map_err(|e| AppError::Telegram(e.to_string()))?;
         Ok(())
     }
 
@@ -249,7 +256,16 @@ pub fn is_interrupt_command(text: &str) -> bool {
     let normalized = text.trim().to_lowercase();
     matches!(
         normalized.as_str(),
-        "stop" | "/stop" | "cancel" | "/cancel" | "abort" | "/abort" | "esc" | "/esc" | "escape" | "/escape"
+        "stop"
+            | "/stop"
+            | "cancel"
+            | "/cancel"
+            | "abort"
+            | "/abort"
+            | "esc"
+            | "/esc"
+            | "escape"
+            | "/escape"
     )
 }
 

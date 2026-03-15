@@ -11,6 +11,7 @@ pub fn strip_ansi(text: &str) -> String {
 
 /// Escape special characters for Telegram Markdown (not V2)
 /// Keeps code blocks intact
+#[allow(dead_code)]
 pub fn escape_markdown(text: &str) -> String {
     // For basic Markdown mode, we only need minimal escaping
     // Code blocks are already handled by the formatting functions
@@ -24,7 +25,12 @@ pub fn format_agent_response(content: &str) -> String {
 }
 
 /// Format tool execution for Telegram
-pub fn format_tool_execution(tool: &str, input: Option<&str>, output: &str, verbose: bool) -> String {
+pub fn format_tool_execution(
+    tool: &str,
+    input: Option<&str>,
+    output: &str,
+    verbose: bool,
+) -> String {
     let mut msg = format!("\u{1f527} *Tool: {}*\n", tool);
 
     if verbose {
@@ -51,7 +57,11 @@ pub fn format_approval_request(prompt: &str) -> String {
 }
 
 /// Format session start notification
-pub fn format_session_start(session_id: &str, project_dir: Option<&str>, hostname: Option<&str>) -> String {
+pub fn format_session_start(
+    session_id: &str,
+    project_dir: Option<&str>,
+    hostname: Option<&str>,
+) -> String {
     let mut msg = format!(
         "\u{1f680} *Session Started*\n\nSession ID: `{}`",
         session_id
@@ -67,10 +77,7 @@ pub fn format_session_start(session_id: &str, project_dir: Option<&str>, hostnam
 
 /// Format session end notification
 pub fn format_session_end(session_id: &str, duration_ms: Option<u64>) -> String {
-    let mut msg = format!(
-        "\u{1f44b} *Session Ended*\n\nSession ID: `{}`",
-        session_id
-    );
+    let mut msg = format!("\u{1f44b} *Session Ended*\n\nSession ID: `{}`", session_id);
     if let Some(dur) = duration_ms {
         let minutes = dur / 60000;
         let seconds = (dur % 60000) / 1000;
@@ -80,6 +87,7 @@ pub fn format_session_end(session_id: &str, duration_ms: Option<u64>) -> String 
 }
 
 /// Format status message
+#[allow(dead_code)]
 pub fn format_status(is_active: bool, session_id: Option<&str>, muted: bool) -> String {
     if !is_active {
         return "\u{1f4ca} *Status*\n\nNo active session attached.".to_string();
@@ -98,10 +106,7 @@ pub fn format_status(is_active: bool, session_id: Option<&str>, muted: bool) -> 
 
 /// Format error message for Telegram
 pub fn format_error(error: &str) -> String {
-    format!(
-        "\u{274c} *Error:*\n\n```\n{}\n```",
-        strip_ansi(error)
-    )
+    format!("\u{274c} *Error:*\n\n```\n{}\n```", strip_ansi(error))
 }
 
 /// Format help message
@@ -223,10 +228,7 @@ pub fn format_tool_details(tool: &str, input: &serde_json::Value) -> String {
                 .and_then(|d| d.get("command"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let mut msg = format!(
-                "\u{1f4bb} *Bash*\n\n```bash\n{}\n```",
-                truncate(cmd, 1500)
-            );
+            let mut msg = format!("\u{1f4bb} *Bash*\n\n```bash\n{}\n```", truncate(cmd, 1500));
             if let Some(timeout) = data.and_then(|d| d.get("timeout")).and_then(|v| v.as_u64()) {
                 msg.push_str(&format!("\n\u{23f1} Timeout: {}ms", timeout));
             }
@@ -279,6 +281,7 @@ pub fn format_tool_details(tool: &str, input: &serde_json::Value) -> String {
 }
 
 /// Split a message into chunks that fit Telegram's 4096 char limit
+#[allow(dead_code)]
 pub fn chunk_message(text: &str, max_length: usize) -> Vec<String> {
     if text.len() <= max_length {
         return vec![text.to_string()];

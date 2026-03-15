@@ -10,7 +10,7 @@ mod socket;
 mod types;
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -55,8 +55,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_target(false)
         .compact()
@@ -140,8 +139,8 @@ async fn cmd_doctor(fix: bool) -> anyhow::Result<()> {
     println!("Claude Telegram Mirror - Doctor");
     println!("================================");
 
-    let mut issues = 0;
-    let mut fixed = 0;
+    let mut issues: usize = 0;
+    let mut fixed: usize = 0;
 
     // Check Rust binary
     println!("\n[1/6] Binary...");
@@ -153,7 +152,8 @@ async fn cmd_doctor(fix: bool) -> anyhow::Result<()> {
         Some(home) => home.join(".config").join("claude-telegram-mirror"),
         None => {
             println!("  ERROR: Cannot determine home directory");
-            issues += 1;
+            println!("\n================================");
+            println!("1 issues found, 0 fixed");
             return Ok(());
         }
     };
@@ -218,7 +218,10 @@ async fn cmd_doctor(fix: bool) -> anyhow::Result<()> {
     // Check socket
     println!("\n[5/6] Socket...");
     if cfg.socket_path.exists() {
-        println!("  OK: Bridge socket exists at {}", cfg.socket_path.display());
+        println!(
+            "  OK: Bridge socket exists at {}",
+            cfg.socket_path.display()
+        );
     } else {
         println!("  INFO: Bridge socket not found (daemon not running)");
     }
@@ -244,11 +247,7 @@ async fn cmd_doctor(fix: bool) -> anyhow::Result<()> {
     if issues == 0 {
         println!("All checks passed!");
     } else {
-        println!(
-            "{} issues found, {} fixed",
-            issues,
-            fixed
-        );
+        println!("{} issues found, {} fixed", issues, fixed);
     }
 
     Ok(())

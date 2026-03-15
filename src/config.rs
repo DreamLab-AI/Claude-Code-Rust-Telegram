@@ -6,6 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Config {
     pub bot_token: String,
     pub chat_id: i64,
@@ -192,7 +193,10 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
         use_threads: env_bool("TELEGRAM_USE_THREADS", file.use_threads.unwrap_or(true)),
         chunk_size: env_usize("TELEGRAM_CHUNK_SIZE", file.chunk_size.unwrap_or(4000)),
         rate_limit: env_u32("TELEGRAM_RATE_LIMIT", file.rate_limit.unwrap_or(1)),
-        session_timeout: env_u64("TELEGRAM_SESSION_TIMEOUT", file.session_timeout.unwrap_or(30)),
+        session_timeout: env_u64(
+            "TELEGRAM_SESSION_TIMEOUT",
+            file.session_timeout.unwrap_or(30),
+        ),
         stale_session_timeout_hours: env_u64(
             "TELEGRAM_STALE_SESSION_TIMEOUT_HOURS",
             file.stale_session_timeout_hours.unwrap_or(72),
@@ -210,6 +214,7 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
 }
 
 /// Save config to file with secure permissions (0o600)
+#[allow(dead_code)]
 pub fn save_config(config: &Config) -> Result<()> {
     ensure_config_dir(&config.config_dir)?;
 

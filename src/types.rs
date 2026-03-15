@@ -1,3 +1,4 @@
+#![allow(dead_code)] // Types module defines the full public API surface
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -268,6 +269,5 @@ pub struct InlineButton {
 // ============ Allowed tmux keys (whitelist) ============
 
 pub const ALLOWED_TMUX_KEYS: &[&str] = &[
-    "Enter", "Escape", "Tab", "C-c", "C-u", "C-d", "C-l",
-    "Up", "Down", "Left", "Right", "BSpace",
+    "Enter", "Escape", "Tab", "C-c", "C-u", "C-d", "C-l", "Up", "Down", "Left", "Right", "BSpace",
 ];
