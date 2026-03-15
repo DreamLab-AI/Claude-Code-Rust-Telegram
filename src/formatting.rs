@@ -125,12 +125,17 @@ pub fn format_help() -> String {
         .to_string()
 }
 
-/// Truncate text with ellipsis
+/// Truncate text with ellipsis (UTF-8 safe)
 fn truncate(text: &str, max_len: usize) -> String {
-    if text.len() <= max_len {
+    if text.chars().count() <= max_len {
         text.to_string()
     } else {
-        format!("{}...", &text[..max_len.saturating_sub(3)])
+        let boundary = text
+            .char_indices()
+            .nth(max_len.saturating_sub(3))
+            .map(|(i, _)| i)
+            .unwrap_or(text.len());
+        format!("{}...", &text[..boundary])
     }
 }
 
@@ -288,11 +293,18 @@ pub fn chunk_message(text: &str, max_length: usize) -> Vec<String> {
                 chunks.push(current);
                 current = String::new();
             }
-            // If single line exceeds max, split it
+            // If single line exceeds max, split it (UTF-8 safe)
             if line.len() > max_length {
                 let mut remaining = line;
                 while remaining.len() > max_length {
-                    let (chunk, rest) = remaining.split_at(max_length);
+                    // Find a char boundary at or before max_length
+                    let boundary = remaining
+                        .char_indices()
+                        .take_while(|(i, _)| *i <= max_length)
+                        .last()
+                        .map(|(i, _)| i)
+                        .unwrap_or(remaining.len());
+                    let (chunk, rest) = remaining.split_at(boundary);
                     chunks.push(chunk.to_string());
                     remaining = rest;
                 }

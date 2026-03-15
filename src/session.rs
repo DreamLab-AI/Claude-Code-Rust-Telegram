@@ -149,14 +149,13 @@ impl SessionManager {
     }
 
     pub fn get_active_sessions(&self) -> Vec<Session> {
-        let mut stmt = self
-            .db
+        self.db
             .prepare("SELECT * FROM sessions WHERE status = 'active' ORDER BY last_activity DESC")
-            .unwrap();
-        stmt.query_map([], |row| Self::row_to_session(row))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([], |row| Self::row_to_session(row))?;
+                Ok(rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default()
     }
 
     pub fn set_session_thread(&self, session_id: &str, thread_id: i64) {
@@ -323,31 +322,29 @@ impl SessionManager {
 
     pub fn get_stale_session_candidates(&self, timeout_hours: u64) -> Vec<Session> {
         let cutoff = Utc::now() - chrono::Duration::hours(timeout_hours as i64);
-        let mut stmt = self
-            .db
+        self.db
             .prepare(
                 "SELECT * FROM sessions WHERE status = 'active' AND last_activity < ?1 ORDER BY last_activity ASC",
             )
-            .unwrap();
-        stmt.query_map(params![cutoff.to_rfc3339()], |row| {
-            Self::row_to_session(row)
-        })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect()
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map(params![cutoff.to_rfc3339()], |row| {
+                    Self::row_to_session(row)
+                })?;
+                Ok(rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default()
     }
 
     pub fn get_orphaned_thread_sessions(&self) -> Vec<Session> {
-        let mut stmt = self
-            .db
+        self.db
             .prepare(
                 "SELECT * FROM sessions WHERE status = 'ended' AND thread_id IS NOT NULL ORDER BY last_activity ASC",
             )
-            .unwrap();
-        stmt.query_map([], |row| Self::row_to_session(row))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([], |row| Self::row_to_session(row))?;
+                Ok(rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default()
     }
 
     pub fn is_tmux_target_owned_by_other(&self, tmux_target: &str, exclude_session_id: &str) -> bool {

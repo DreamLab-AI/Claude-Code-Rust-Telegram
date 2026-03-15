@@ -272,11 +272,11 @@ impl BridgeShared {
             sessions.get_session_thread(&session_id)
         };
 
-        if thread_id.is_some() {
+        if let Some(tid) = thread_id {
             self.session_threads
                 .write()
                 .await
-                .insert(session_id.clone(), thread_id.unwrap() as i32);
+                .insert(session_id.clone(), tid as i32);
         } else if self.config.use_threads {
             let topic_name = format_topic_name(
                 &session_id,
@@ -326,7 +326,7 @@ impl BridgeShared {
         };
 
         if let Some(session) = session {
-            let duration = (chrono::Utc::now() - session.started_at).num_milliseconds() as u64;
+            let duration = (chrono::Utc::now() - session.started_at).num_milliseconds().max(0) as u64;
             let thread_id = self.get_session_thread_id(&msg.session_id).await;
 
             let _ = self
@@ -702,11 +702,10 @@ impl BridgeShared {
             None => return, // Unknown topic, ignore (multi-bot)
         };
 
-        // Restore tmux target
-        let mut inj = self.injector.lock().await;
+        // Resolve tmux target BEFORE acquiring injector lock (prevent deadlock)
         let tmux_target = self.session_tmux_targets.read().await.get(&session.id).cloned();
-        if let Some(target) = &tmux_target {
-            inj.set_target(target, session.tmux_socket.as_deref());
+        let (resolved_target, resolved_socket) = if let Some(target) = tmux_target {
+            (Some(target), session.tmux_socket.clone())
         } else {
             // Restore from database
             let (db_target, db_socket) = {
@@ -714,12 +713,18 @@ impl BridgeShared {
                 sessions.get_tmux_info(&session.id)
             };
             if let Some(target) = &db_target {
-                inj.set_target(target, db_socket.as_deref());
                 self.session_tmux_targets
                     .write()
                     .await
                     .insert(session.id.clone(), target.clone());
             }
+            (db_target, db_socket)
+        };
+
+        // Now acquire injector lock with no other locks held
+        let mut inj = self.injector.lock().await;
+        if let Some(target) = &resolved_target {
+            inj.set_target(target, resolved_socket.as_deref());
         }
 
         // Check for cc command prefix
@@ -1064,11 +1069,11 @@ fn format_topic_name(session_id: &str, hostname: Option<&str>, project_dir: Opti
         .chars()
         .take(8)
         .collect::<String>();
-    parts.push(short_id.clone());
 
     if parts.is_empty() {
         format!("Session {}", short_id)
     } else {
+        parts.push(short_id);
         parts.join(" \u{2022} ")
     }
 }

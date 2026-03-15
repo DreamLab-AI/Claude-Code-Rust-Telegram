@@ -50,11 +50,10 @@ struct ConfigFile {
     topic_delete_delay_minutes: Option<u64>,
 }
 
-fn config_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".config")
-        .join("claude-telegram-mirror")
+fn config_dir() -> Result<PathBuf> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| AppError::Config("Cannot determine home directory".to_string()))?;
+    Ok(home.join(".config").join("claude-telegram-mirror"))
 }
 
 /// Ensure config directory exists with secure permissions (0o700)
@@ -128,7 +127,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 
 /// Load configuration: env vars > config file > defaults
 pub fn load_config(require_auth: bool) -> Result<Config> {
-    let dir = config_dir();
+    let dir = config_dir()?;
     ensure_config_dir(&dir)?;
 
     let file = load_config_file(&dir);
@@ -144,7 +143,17 @@ pub fn load_config(require_auth: bool) -> Result<Config> {
         .or_else(|| file.chat_id.map(|id| id.to_string()))
         .unwrap_or_default();
 
-    let chat_id: i64 = chat_id_str.parse().unwrap_or(0);
+    let chat_id: i64 = if chat_id_str.is_empty() {
+        0
+    } else {
+        chat_id_str.parse().map_err(|_| {
+            AppError::Config(format!(
+                "TELEGRAM_CHAT_ID '{}' is not a valid integer.\n\
+                 Chat IDs for supergroups start with -100.",
+                chat_id_str
+            ))
+        })?
+    };
 
     if require_auth {
         if bot_token.is_empty() {

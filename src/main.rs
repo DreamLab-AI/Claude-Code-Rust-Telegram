@@ -149,10 +149,14 @@ async fn cmd_doctor(fix: bool) -> anyhow::Result<()> {
 
     // Check config directory
     println!("\n[2/6] Config directory...");
-    let config_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".config")
-        .join("claude-telegram-mirror");
+    let config_dir = match dirs::home_dir() {
+        Some(home) => home.join(".config").join("claude-telegram-mirror"),
+        None => {
+            println!("  ERROR: Cannot determine home directory");
+            issues += 1;
+            return Ok(());
+        }
+    };
 
     if config_dir.exists() {
         // Check permissions
