@@ -434,6 +434,42 @@ pub fn summarize_tool_action(tool: &str, input: Option<&serde_json::Value>) -> S
     }
 }
 
+/// Given a chained command (e.g. `sleep 5 && cargo test`), find the most
+/// meaningful segment by skipping trivial commands like sleep, cd, true, echo.
+fn find_meaningful_command(cmd: &str) -> &str {
+    // Split on &&, ||, ; (but not inside quotes)
+    let separators = ["&&", "||", ";"];
+    let segments: Vec<&str> = {
+        let mut segs = vec![cmd];
+        for sep in &separators {
+            segs = segs.into_iter().flat_map(|s| s.split(sep)).collect();
+        }
+        segs.into_iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+
+    // Trivial commands to skip when a more meaningful alternative exists
+    let trivial = [
+        "sleep", "wait", "true", "false", "echo", "printf", "cd", "pushd", "popd", "export", "set",
+        "unset", ":", "test", "[",
+    ];
+
+    // Find first non-trivial segment
+    for seg in &segments {
+        // For piped commands, take the first part of the pipe
+        let first_part = seg.split('|').next().unwrap_or(seg).trim();
+        let first_word = first_part.split_whitespace().next().unwrap_or("");
+        if !trivial.contains(&first_word) {
+            return first_part;
+        }
+    }
+
+    // All segments are trivial — return the last one
+    segments.last().unwrap_or(&cmd)
+}
+
 /// Summarize a Bash command into human-readable form
 fn summarize_bash(obj: Option<&serde_json::Map<String, serde_json::Value>>) -> String {
     let cmd = match obj.and_then(|o| o.get("command")).and_then(|v| v.as_str()) {
@@ -441,18 +477,22 @@ fn summarize_bash(obj: Option<&serde_json::Map<String, serde_json::Value>>) -> S
         None => return "Running a command".to_string(),
     };
 
-    // Extract the first word/program from the command
-    let first_word = cmd.split_whitespace().next().unwrap_or("");
+    // For chained commands (&&, ;, |), find the most meaningful segment
+    let meaningful_cmd = find_meaningful_command(cmd);
+    let first_word = meaningful_cmd.split_whitespace().next().unwrap_or("");
 
     match first_word {
-        "cargo" => summarize_cargo(cmd),
-        "git" => summarize_git(cmd),
-        "npm" | "npx" | "yarn" | "pnpm" | "bun" => summarize_node(cmd),
-        "pip" | "pip3" | "python" | "python3" | "pytest" => summarize_python(cmd),
+        "cargo" => summarize_cargo(meaningful_cmd),
+        "git" => summarize_git(meaningful_cmd),
+        "npm" | "npx" | "yarn" | "pnpm" | "bun" => summarize_node(meaningful_cmd),
+        "pip" | "pip3" | "python" | "python3" | "pytest" => summarize_python(meaningful_cmd),
         "rustc" | "rustup" => format!("Running {}", first_word),
-        "docker" | "docker-compose" => summarize_docker(cmd),
+        "docker" | "docker-compose" => summarize_docker(meaningful_cmd),
         "make" => {
-            let target = cmd.split_whitespace().nth(1).unwrap_or("default");
+            let target = meaningful_cmd
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("default");
             format!("Running make {}", target)
         }
         "curl" => "Making HTTP request".to_string(),
@@ -465,7 +505,7 @@ fn summarize_bash(obj: Option<&serde_json::Map<String, serde_json::Value>>) -> S
         "mv" => "Moving files".to_string(),
         "ln" => "Creating symlink".to_string(),
         "tar" => {
-            if cmd.contains('x') {
+            if meaningful_cmd.contains('x') {
                 "Extracting archive".to_string()
             } else {
                 "Creating archive".to_string()
@@ -477,10 +517,40 @@ fn summarize_bash(obj: Option<&serde_json::Map<String, serde_json::Value>>) -> S
         "kill" | "killall" | "pkill" => "Stopping process".to_string(),
         "ps" => "Listing processes".to_string(),
         "ls" => "Listing directory".to_string(),
+        "nohup" | "timeout" | "env" | "nice" | "sudo" => {
+            // Skip wrapper commands and recurse on the inner command
+            let inner = meaningful_cmd
+                .split_once(char::is_whitespace)
+                .map(|x| x.1)
+                .unwrap_or("");
+            let inner_first = inner.split_whitespace().next().unwrap_or("");
+            if !inner_first.is_empty() && inner_first != first_word {
+                summarize_bash(Some(&serde_json::Map::from_iter([(
+                    "command".to_string(),
+                    serde_json::Value::String(inner.to_string()),
+                )])))
+            } else {
+                format!("Running {}", first_word)
+            }
+        }
+        "sleep" | "wait" | "true" | "echo" | "printf" | "cat" | "head" | "tail" | "wc" | "sort"
+        | "uniq" | "tee" | "tr" | "cut" | "sed" | "awk" | "grep" | "pgrep" | "xargs" => {
+            // Utility commands — summarize tersely
+            let short: String = meaningful_cmd.chars().take(50).collect();
+            let ellipsis = if meaningful_cmd.chars().count() > 50 {
+                "..."
+            } else {
+                ""
+            };
+            format!("Running `{}{}`", short, ellipsis)
+        }
         _ => {
-            // For chained commands, just describe the first meaningful one
-            let short: String = cmd.chars().take(60).collect();
-            let ellipsis = if cmd.chars().count() > 60 { "..." } else { "" };
+            let short: String = meaningful_cmd.chars().take(50).collect();
+            let ellipsis = if meaningful_cmd.chars().count() > 50 {
+                "..."
+            } else {
+                ""
+            };
             format!("Running `{}{}`", short, ellipsis)
         }
     }
@@ -823,5 +893,46 @@ mod tests {
                 .starts_with("Failed:")
         );
         assert!(summarize_tool_result("Bash", "Error: file not found").starts_with("Failed:"));
+    }
+
+    #[test]
+    fn test_find_meaningful_command() {
+        // Skips trivial prefixes
+        assert_eq!(
+            find_meaningful_command("sleep 5 && cargo test"),
+            "cargo test"
+        );
+        assert_eq!(
+            find_meaningful_command("cd /tmp && git status"),
+            "git status"
+        );
+        assert_eq!(
+            find_meaningful_command("export FOO=bar && npm run build"),
+            "npm run build"
+        );
+
+        // Returns whole command if no chain
+        assert_eq!(
+            find_meaningful_command("cargo build --release"),
+            "cargo build --release"
+        );
+
+        // All trivial — returns last
+        assert_eq!(find_meaningful_command("cd /tmp && echo done"), "echo done");
+
+        // Semicolons work too
+        assert_eq!(find_meaningful_command("sleep 1; cargo test"), "cargo test");
+    }
+
+    #[test]
+    fn test_summarize_chained_bash() {
+        let input = serde_json::json!({"command": "sleep 5 && cargo test"});
+        assert_eq!(summarize_tool_action("Bash", Some(&input)), "Running tests");
+
+        let input = serde_json::json!({"command": "cd /tmp && git push"});
+        assert_eq!(
+            summarize_tool_action("Bash", Some(&input)),
+            "Pushing to remote"
+        );
     }
 }

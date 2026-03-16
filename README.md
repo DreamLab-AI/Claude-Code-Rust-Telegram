@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/Tests-21%20passing-green.svg)]()
+[![Tests](https://img.shields.io/badge/Tests-23%20passing-green.svg)]()
 [![Clippy](https://img.shields.io/badge/Clippy-0%20warnings-green.svg)]()
 
 Monitor and control Claude Code from your phone. CTM is a Rust daemon that bridges Claude Code CLI sessions to Telegram, giving you a real-time mobile interface to what Claude is doing.
@@ -26,6 +26,8 @@ You (phone)                    Your machine
 - Approve/reject tool executions with inline buttons
 - Each Claude session gets its own Forum Topic thread
 - Type prompts, stop, or kill Claude directly from chat
+- Send photos/files from Telegram directly into Claude's session
+- Send images and documents from Claude back to Telegram
 
 ## Quick Start
 
@@ -70,6 +72,12 @@ This is a security-focused rewrite of the original TypeScript version. The TypeS
 - **Send prompts** — Type in Telegram, text appears in Claude's CLI
 - **Stop/interrupt** — Send `stop` to press Escape, `kill` to send Ctrl-C
 - **Slash commands** — `cc clear`, `cc compact` forwarded to Claude
+
+### Image & File Support
+- **Telegram → Claude** — Send photos or documents from Telegram; they're downloaded locally and the file path is injected into Claude's tmux session
+- **Claude → Telegram** — Send images or files to Telegram via the bridge socket using the `send_image` message type
+- Photos include dimensions; documents include file size and original filename
+- Secure download directory (`/tmp/ctm-images/`) with UUID-based filenames and `0o600` permissions
 
 ### Tool Approval
 - **Inline keyboards** — Approve, Reject, or Abort with one tap
@@ -182,6 +190,7 @@ ctm setup              # Interactive setup wizard
 | Input | Action |
 |-------|--------|
 | Any text | Sends as input to Claude |
+| Photo/file | Downloads and injects file path into Claude's session |
 | `stop` / `esc` | Sends Escape (pause Claude) |
 | `kill` / `ctrl-c` | Sends Ctrl-C (exit Claude) |
 | `cc clear` | Sends `/clear` to Claude |
@@ -189,6 +198,17 @@ ctm setup              # Interactive setup wizard
 | `/status` | Show active sessions |
 | `/help` | Show commands |
 | `/ping` | Health check |
+
+## Sending Images to Telegram
+
+Any script or tool can send images/files to Telegram via the bridge socket:
+
+```bash
+echo '{"type":"send_image","sessionId":"test","content":"/tmp/diagram.png","metadata":{"caption":"Architecture diagram"},"timestamp":"now"}' \
+  | socat - UNIX-CONNECT:~/.config/claude-telegram-mirror/bridge.sock
+```
+
+The `content` field is the absolute path to the file. Image extensions (jpg, png, gif, webp, bmp) are sent as photos; everything else is sent as a document. The optional `caption` metadata field adds a caption. If `sessionId` matches an active session, the file is posted to that session's forum topic.
 
 ## Configuration Reference
 
@@ -266,8 +286,8 @@ Run CTM on multiple machines with a shared Telegram group:
 
 | Module | Lines | Responsibility |
 |--------|-------|---------------|
-| `bridge.rs` | ~1100 | Central orchestrator: routes messages between all components |
-| `bot.rs` | ~300 | Telegram API: send/receive, forums, inline keyboards, rate limiting |
+| `bridge.rs` | ~1500 | Central orchestrator: routes messages between all components |
+| `bot.rs` | ~400 | Telegram API: send/receive, forums, inline keyboards, file transfer, rate limiting |
 | `socket.rs` | ~250 | Unix socket server with flock PID locking, NDJSON protocol |
 | `session.rs` | ~250 | SQLite persistence: sessions, approvals, stale cleanup |
 | `formatting.rs` | ~700 | Tool summaries, message formatting, ANSI stripping, chunking |
@@ -299,7 +319,7 @@ ctm doctor --fix     # Auto-fix permissions and config
 ```bash
 cargo build              # Debug build
 cargo build --release    # Optimized release build (~8MB binary)
-cargo test               # 21 tests
+cargo test               # 23 tests
 cargo clippy             # 0 warnings
 cargo fmt --check        # Check formatting
 RUST_LOG=debug ctm start # Verbose logging

@@ -20,6 +20,7 @@ pub enum MessageType {
     SessionEnd,
     TurnComplete,
     PreCompact,
+    SendImage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -8,6 +8,7 @@ use crate::socket::SocketServer;
 use crate::summarizer::LlmSummarizer;
 use crate::types::{BridgeMessage, InlineButton, MessageType, SendOptions, SessionStatus};
 use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::time::{self, Duration};
@@ -25,6 +26,8 @@ pub struct Bridge {
     compacting_sessions: Arc<RwLock<HashSet<String>>>,
     pending_deletions: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
     summarizer: Arc<LlmSummarizer>,
+    /// Sessions that have already been renamed with a task description
+    named_sessions: Arc<RwLock<HashSet<String>>>,
 }
 
 struct CachedToolInput {
@@ -53,6 +56,7 @@ impl Bridge {
             compacting_sessions: Arc::new(RwLock::new(HashSet::new())),
             pending_deletions: Arc::new(RwLock::new(HashMap::new())),
             summarizer: Arc::new(summarizer),
+            named_sessions: Arc::new(RwLock::new(HashSet::new())),
         })
     }
 
@@ -153,6 +157,7 @@ impl Bridge {
             compacting_sessions: self.compacting_sessions.clone(),
             pending_deletions: self.pending_deletions.clone(),
             summarizer: self.summarizer.clone(),
+            named_sessions: self.named_sessions.clone(),
         }
     }
 }
@@ -171,6 +176,7 @@ struct BridgeShared {
     compacting_sessions: Arc<RwLock<HashSet<String>>>,
     pending_deletions: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
     summarizer: Arc<LlmSummarizer>,
+    named_sessions: Arc<RwLock<HashSet<String>>>,
 }
 
 impl BridgeShared {
@@ -258,6 +264,9 @@ impl BridgeShared {
             MessageType::PreCompact => {
                 self.ensure_session_exists(&msg).await?;
                 self.handle_pre_compact(&msg).await?;
+            }
+            MessageType::SendImage => {
+                self.handle_send_image(&msg).await?;
             }
             _ => {
                 tracing::debug!(msg_type = ?msg.msg_type, "Unhandled message type");
@@ -513,6 +522,34 @@ impl BridgeShared {
         }
 
         let thread_id = self.get_session_thread_id(&msg.session_id).await;
+
+        // Rename topic on first user prompt to include the task description
+        if let Some(tid) = thread_id {
+            let already_named = self.named_sessions.read().await.contains(&msg.session_id);
+            if !already_named && !msg.content.trim().is_empty() {
+                self.named_sessions
+                    .write()
+                    .await
+                    .insert(msg.session_id.clone());
+
+                let project = {
+                    let sessions = self.sessions.lock().await;
+                    sessions
+                        .get_session(&msg.session_id)
+                        .and_then(|s| s.project_dir)
+                        .and_then(|d| d.rsplit('/').next().map(|s| s.to_string()))
+                };
+
+                let task_desc = build_task_description(&msg.content);
+                let topic_name = match project {
+                    Some(proj) => format!("{} — {}", proj, task_desc),
+                    None => task_desc,
+                };
+
+                let _ = self.bot.edit_forum_topic(tid, &topic_name).await;
+            }
+        }
+
         let _ = self
             .bot
             .send_message(
@@ -591,6 +628,41 @@ impl BridgeShared {
             .await;
     }
 
+    async fn handle_send_image(&self, msg: &BridgeMessage) -> Result<()> {
+        let path = std::path::Path::new(&msg.content);
+
+        if !path.is_absolute() || msg.content.contains("..") {
+            tracing::warn!(path = %msg.content, "SendImage: invalid path");
+            return Ok(());
+        }
+        if !path.exists() {
+            tracing::warn!(path = %msg.content, "SendImage: file not found");
+            return Ok(());
+        }
+
+        let thread_id = self.get_session_thread_id(&msg.session_id).await;
+        let caption = msg.get_metadata_str("caption");
+
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let is_image = matches!(
+            ext.as_str(),
+            "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp"
+        );
+
+        if is_image {
+            self.bot.send_photo(path, caption, thread_id).await?;
+        } else {
+            self.bot.send_document(path, caption, thread_id).await?;
+        }
+
+        tracing::info!(path = %msg.content, session_id = %msg.session_id, "Sent file to Telegram");
+        Ok(())
+    }
+
     // ============ Telegram Update Handling (Telegram -> CLI) ============
 
     async fn poll_telegram_updates(&self) {
@@ -632,6 +704,10 @@ impl BridgeShared {
                     } else {
                         self.handle_telegram_message(msg, text).await;
                     }
+                } else if msg.photo().is_some() {
+                    self.handle_telegram_photo(msg).await;
+                } else if msg.document().is_some() {
+                    self.handle_telegram_document(msg).await;
                 }
             }
             UpdateKind::CallbackQuery(query) => {
@@ -816,6 +892,242 @@ impl BridgeShared {
                     .send_message(
                         "\u{26a0}\u{fe0f} *Could not send input to CLI*\n\n\
                          No tmux session found. Make sure Claude Code is running in tmux.",
+                        &SendOptions::default(),
+                        Some(tid),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    async fn handle_telegram_photo(&self, msg: &teloxide::types::Message) {
+        let photos = match msg.photo() {
+            Some(p) if !p.is_empty() => p,
+            _ => return,
+        };
+        let photo = &photos[photos.len() - 1]; // largest size
+
+        let thread_id = msg.thread_id.map(|t| t.0 .0);
+        let tid = match thread_id {
+            Some(t) => t,
+            None => return,
+        };
+
+        let session = {
+            let sessions = self.sessions.lock().await;
+            sessions.get_session_by_thread_id(tid as i64)
+        };
+        let session = match session {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Create download directory
+        let download_dir = std::path::Path::new("/tmp/ctm-images");
+        if let Err(e) = tokio::fs::create_dir_all(download_dir).await {
+            tracing::error!(error = %e, "Failed to create download directory");
+            return;
+        }
+        let _ =
+            tokio::fs::set_permissions(download_dir, std::fs::Permissions::from_mode(0o700)).await;
+
+        let uuid = uuid::Uuid::new_v4();
+        let temp_path = download_dir.join(format!("{}.downloading", uuid));
+
+        let ext = match self.bot.download_file_to(&photo.file.id, &temp_path).await {
+            Ok(ext) => ext,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to download photo");
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return;
+            }
+        };
+
+        let final_path = download_dir.join(format!("{}.{}", uuid, ext));
+        if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
+            tracing::error!(error = %e, "Failed to rename downloaded file");
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return;
+        }
+        let _ =
+            tokio::fs::set_permissions(&final_path, std::fs::Permissions::from_mode(0o600)).await;
+
+        let mut notification = format!(
+            "[Image from Telegram: {} ({}x{})]",
+            final_path.display(),
+            photo.width,
+            photo.height
+        );
+        if let Some(caption) = msg.caption() {
+            notification.push_str(&format!("\nCaption: \"{}\"", caption));
+        }
+
+        // Resolve tmux target and inject
+        let tmux_target = self
+            .session_tmux_targets
+            .read()
+            .await
+            .get(&session.id)
+            .cloned();
+        let (resolved_target, resolved_socket) = if let Some(target) = tmux_target {
+            (Some(target), session.tmux_socket.clone())
+        } else {
+            let (db_target, db_socket) = {
+                let sessions = self.sessions.lock().await;
+                sessions.get_tmux_info(&session.id)
+            };
+            if let Some(target) = &db_target {
+                self.session_tmux_targets
+                    .write()
+                    .await
+                    .insert(session.id.clone(), target.clone());
+            }
+            (db_target, db_socket)
+        };
+
+        let mut inj = self.injector.lock().await;
+        if let Some(target) = &resolved_target {
+            inj.set_target(target, resolved_socket.as_deref());
+        }
+
+        match inj.inject(&notification) {
+            Ok(true) => {
+                tracing::info!(
+                    session_id = %session.id,
+                    path = %final_path.display(),
+                    "Injected photo path to CLI"
+                );
+            }
+            Ok(false) | Err(_) => {
+                let _ = self
+                    .bot
+                    .send_message(
+                        "\u{26a0}\u{fe0f} *Photo received but could not inject to CLI*\n\n\
+                         File saved but no tmux session found.",
+                        &SendOptions::default(),
+                        Some(tid),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    async fn handle_telegram_document(&self, msg: &teloxide::types::Message) {
+        let doc = match msg.document() {
+            Some(d) => d,
+            None => return,
+        };
+
+        let thread_id = msg.thread_id.map(|t| t.0 .0);
+        let tid = match thread_id {
+            Some(t) => t,
+            None => return,
+        };
+
+        let session = {
+            let sessions = self.sessions.lock().await;
+            sessions.get_session_by_thread_id(tid as i64)
+        };
+        let session = match session {
+            Some(s) => s,
+            None => return,
+        };
+
+        let download_dir = std::path::Path::new("/tmp/ctm-images");
+        if let Err(e) = tokio::fs::create_dir_all(download_dir).await {
+            tracing::error!(error = %e, "Failed to create download directory");
+            return;
+        }
+        let _ =
+            tokio::fs::set_permissions(download_dir, std::fs::Permissions::from_mode(0o700)).await;
+
+        let uuid = uuid::Uuid::new_v4();
+        let temp_path = download_dir.join(format!("{}.downloading", uuid));
+
+        let ext = match self.bot.download_file_to(&doc.file.id, &temp_path).await {
+            Ok(ext) => ext,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to download document");
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return;
+            }
+        };
+
+        // Build safe filename: UUID prefix + sanitized original name
+        let safe_name = doc
+            .file_name
+            .as_deref()
+            .map(|n| n.replace(['/', '\\'], "_"))
+            .map(|n| {
+                if n.starts_with('.') {
+                    format!("_{}", n)
+                } else {
+                    n
+                }
+            })
+            .unwrap_or_else(|| format!("file.{}", ext));
+        let final_path = download_dir.join(format!("{}_{}", uuid, safe_name));
+
+        if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
+            tracing::error!(error = %e, "Failed to rename downloaded file");
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return;
+        }
+        let _ =
+            tokio::fs::set_permissions(&final_path, std::fs::Permissions::from_mode(0o600)).await;
+
+        let file_size = format_file_size(doc.file.size as u64);
+        let mut notification = format!(
+            "[File from Telegram: {} ({})]",
+            final_path.display(),
+            file_size
+        );
+        if let Some(caption) = msg.caption() {
+            notification.push_str(&format!("\nCaption: \"{}\"", caption));
+        }
+
+        // Resolve tmux target and inject
+        let tmux_target = self
+            .session_tmux_targets
+            .read()
+            .await
+            .get(&session.id)
+            .cloned();
+        let (resolved_target, resolved_socket) = if let Some(target) = tmux_target {
+            (Some(target), session.tmux_socket.clone())
+        } else {
+            let (db_target, db_socket) = {
+                let sessions = self.sessions.lock().await;
+                sessions.get_tmux_info(&session.id)
+            };
+            if let Some(target) = &db_target {
+                self.session_tmux_targets
+                    .write()
+                    .await
+                    .insert(session.id.clone(), target.clone());
+            }
+            (db_target, db_socket)
+        };
+
+        let mut inj = self.injector.lock().await;
+        if let Some(target) = &resolved_target {
+            inj.set_target(target, resolved_socket.as_deref());
+        }
+
+        match inj.inject(&notification) {
+            Ok(true) => {
+                tracing::info!(
+                    session_id = %session.id,
+                    path = %final_path.display(),
+                    "Injected document path to CLI"
+                );
+            }
+            Ok(false) | Err(_) => {
+                let _ = self
+                    .bot
+                    .send_message(
+                        "\u{26a0}\u{fe0f} *File received but could not inject to CLI*\n\n\
+                         File saved but no tmux session found.",
                         &SendOptions::default(),
                         Some(tid),
                     )
@@ -1088,33 +1400,84 @@ impl BridgeShared {
     }
 }
 
-/// Format topic name for a session
+/// Format initial topic name for a session (before first prompt is known).
+/// Shows project name; will be renamed to include task once the first prompt arrives.
 fn format_topic_name(
-    session_id: &str,
+    _session_id: &str,
     hostname: Option<&str>,
     project_dir: Option<&str>,
 ) -> String {
-    let mut parts = Vec::new();
+    let project = project_dir
+        .and_then(|d| d.rsplit('/').next())
+        .unwrap_or("Claude");
 
-    if let Some(host) = hostname {
-        parts.push(host.to_string());
+    match hostname {
+        Some(host) => format!("{} ({})", project, host),
+        None => project.to_string(),
     }
+}
 
-    if let Some(dir) = project_dir {
-        let basename = dir.rsplit('/').next().unwrap_or(dir);
-        parts.push(basename.to_string());
-    }
+/// Build a short task description from the user's first prompt.
+/// Extracts the first meaningful sentence/fragment, capped at 40 chars.
+fn build_task_description(prompt: &str) -> String {
+    let cleaned = prompt.trim();
 
-    let short_id = session_id
-        .replace("session-", "")
-        .chars()
-        .take(8)
-        .collect::<String>();
+    // Take the first line
+    let first_line = cleaned.lines().next().unwrap_or(cleaned);
 
-    if parts.is_empty() {
-        format!("Session {}", short_id)
+    // Remove common prefixes
+    let trimmed = first_line
+        .trim_start_matches("please ")
+        .trim_start_matches("Please ")
+        .trim_start_matches("can you ")
+        .trim_start_matches("Can you ")
+        .trim_start_matches("could you ")
+        .trim_start_matches("Could you ")
+        .trim_start_matches("I need to ")
+        .trim_start_matches("I want to ")
+        .trim_start_matches("Let's ")
+        .trim_start_matches("let's ");
+
+    // Capitalize first letter
+    let mut chars = trimmed.chars();
+    let capitalized = match chars.next() {
+        Some(c) => {
+            let upper: String = c.to_uppercase().collect();
+            format!("{}{}", upper, chars.collect::<String>())
+        }
+        None => "New session".to_string(),
+    };
+
+    // Truncate at 40 chars on a word boundary
+    if capitalized.chars().count() <= 40 {
+        capitalized
     } else {
-        parts.push(short_id);
-        parts.join(" \u{2022} ")
+        let mut end = 40;
+        // Find last space before the limit
+        for (i, c) in capitalized.char_indices() {
+            if i > 40 {
+                break;
+            }
+            if c == ' ' {
+                end = i;
+            }
+        }
+        let boundary = capitalized
+            .char_indices()
+            .nth(end)
+            .map(|(i, _)| i)
+            .unwrap_or(capitalized.len());
+        format!("{}...", &capitalized[..boundary])
+    }
+}
+
+/// Format bytes into human-readable size string
+fn format_file_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{}B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.0}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
     }
 }

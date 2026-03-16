@@ -153,6 +153,27 @@ impl TelegramBot {
         }
     }
 
+    /// Rename a forum topic
+    pub async fn edit_forum_topic(&self, thread_id: i32, name: &str) -> Result<bool> {
+        self.rate_limiter.until_ready().await;
+
+        match self
+            .bot
+            .edit_forum_topic(self.chat_id, ThreadId(MessageId(thread_id)))
+            .name(name)
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(%thread_id, %name, "Forum topic renamed");
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, %thread_id, "Failed to rename forum topic");
+                Ok(false)
+            }
+        }
+    }
+
     /// Close a forum topic
     pub async fn close_forum_topic(&self, thread_id: i32) -> Result<bool> {
         self.rate_limiter.until_ready().await;
@@ -254,6 +275,77 @@ impl TelegramBot {
             .map_err(|e| AppError::Telegram(scrub_telegram_error(&e)))?;
 
         Ok(updates)
+    }
+
+    /// Download a Telegram file by file_id, saving to `dest_path`.
+    /// Returns the file extension from the server-side path (e.g. "jpg", "pdf").
+    pub async fn download_file_to(
+        &self,
+        file_id: &str,
+        dest_path: &std::path::Path,
+    ) -> Result<String> {
+        use teloxide::net::Download;
+
+        let file_info = self
+            .bot
+            .get_file(file_id)
+            .await
+            .map_err(|e| AppError::Telegram(scrub_telegram_error(&e)))?;
+
+        let ext = file_info
+            .path
+            .rsplit('.')
+            .next()
+            .unwrap_or("bin")
+            .to_string();
+
+        let mut dest_file = tokio::fs::File::create(dest_path).await?;
+        self.bot
+            .download_file(&file_info.path, &mut dest_file)
+            .await
+            .map_err(|e| AppError::Telegram(format!("download: {}", e)))?;
+
+        Ok(ext)
+    }
+
+    /// Send a photo from a local file path with optional caption and thread targeting.
+    pub async fn send_photo(
+        &self,
+        path: &std::path::Path,
+        caption: Option<&str>,
+        thread_id: Option<i32>,
+    ) -> Result<Message> {
+        self.rate_limiter.until_ready().await;
+        let input_file = teloxide::types::InputFile::file(path.to_path_buf());
+        let mut req = self.bot.send_photo(self.chat_id, input_file);
+        if let Some(c) = caption {
+            req = req.caption(c);
+        }
+        if let Some(tid) = thread_id {
+            req = req.message_thread_id(ThreadId(MessageId(tid)));
+        }
+        req.await
+            .map_err(|e| AppError::Telegram(scrub_telegram_error(&e)))
+    }
+
+    /// Send a document from a local file path with optional caption and thread targeting.
+    pub async fn send_document(
+        &self,
+        path: &std::path::Path,
+        caption: Option<&str>,
+        thread_id: Option<i32>,
+    ) -> Result<Message> {
+        self.rate_limiter.until_ready().await;
+        let input_file = teloxide::types::InputFile::file(path.to_path_buf());
+        let mut req = self.bot.send_document(self.chat_id, input_file);
+        if let Some(c) = caption {
+            req = req.caption(c);
+        }
+        if let Some(tid) = thread_id {
+            req = req.message_thread_id(ThreadId(MessageId(tid)));
+        }
+        req.await
+            .map_err(|e| AppError::Telegram(scrub_telegram_error(&e)))
     }
 }
 
