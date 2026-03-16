@@ -62,10 +62,14 @@ sequenceDiagram
     Note over You,BotFather: Privacy mode must be OFF<br/>for the bot to see all messages
 ```
 
-1. Open Telegram and message [@BotFather](https://t.me/botfather)
-2. Send `/newbot` and follow the prompts
-3. Copy the **bot token** (format: `123456789:ABCdefGHIjklMNOpqrsTUVwxyz`)
-4. **Disable privacy mode**: `/mybots` -> Select bot -> Bot Settings -> Group Privacy -> **Turn off**
+1. Open Telegram (desktop app or mobile — **not** a self-chat)
+2. Use the **search bar** to find `BotFather` — select the one with the **blue verified checkmark**
+3. Start a direct chat with @BotFather and send `/newbot`
+4. BotFather will ask for a **display name** (e.g. "Claude Mirror") and a **username** (must end in `bot`, e.g. `claude_mirror_bot`)
+5. Copy the **bot token** it gives you (format: `123456789:ABCdefGHIjklMNOpqrsTUVwxyz`)
+6. **Disable privacy mode**: `/mybots` -> Select bot -> Bot Settings -> Group Privacy -> **Turn off**
+
+> **Note:** @BotFather is a real Telegram bot you message directly — it is not a settings page or a chat with yourself.
 
 ## Step 3: Create a Supergroup with Topics
 
@@ -83,16 +87,31 @@ graph TB
 ```
 
 1. Create a new group in Telegram
-2. Add your bot to the group
-3. Go to Group Settings -> Enable **Topics**
+2. **Add your bot during group creation**: in the "Add Members" screen, search for your bot's username (e.g. `TheDreamLabBot`) and select it
+3. Go to Group Settings -> Enable **Topics** to convert it to a forum supergroup
 4. Make the bot an **Administrator** with these permissions:
    - Manage Topics
    - Post Messages
    - Delete Messages (optional, for topic cleanup)
 
+> **Telegram Web limitation:** Enabling Topics (converting a group to a forum) may not be available in Telegram Web. Use the **Telegram desktop app** or **mobile app** to enable Topics in group settings. Once enabled, the forum works fine in Telegram Web.
+>
+> **Adding the bot:** If the group already exists, open the group -> click the group name header -> **Add Members** -> search for your bot username.
+
 ## Step 4: Get Your Chat ID
 
 The chat ID identifies your supergroup. Supergroup IDs start with `-100`.
+
+### Easiest method
+
+1. Send any message in the group where your bot is a member
+2. Run this command (replace `YOUR_TOKEN` with your bot token):
+
+```bash
+curl -s "https://api.telegram.org/botYOUR_TOKEN/getUpdates" | python3 -m json.tool
+```
+
+3. Look for `"chat": {"id": -100XXXXXXXXXX}` in the response — that negative number is your chat ID
 
 ### Using the helper script
 
@@ -100,13 +119,43 @@ The chat ID identifies your supergroup. Supergroup IDs start with `-100`.
 ./scripts/get-chat-id.sh YOUR_BOT_TOKEN
 ```
 
-### Manual method
+> **Tip:** If `getUpdates` returns an empty result, make sure you've sent a message in the group **after** adding the bot. The bot only sees messages sent after it joined.
 
-1. Send any message in the group
-2. Visit: `https://api.telegram.org/botYOUR_TOKEN/getUpdates`
-3. Find `"chat": {"id": -100XXXXXXXXXX}` in the response
+## Step 5: Configure
 
-## Step 5: Configure Environment
+### Option A: Config file (recommended)
+
+Create `~/.config/claude-telegram-mirror/config.json`:
+
+```bash
+mkdir -p ~/.config/claude-telegram-mirror
+chmod 700 ~/.config/claude-telegram-mirror
+```
+
+```json
+{
+  "bot_token": "123456789:ABCdefGHIjklMNOpqrsTUVwxyz",
+  "chat_id": -1001234567890,
+  "enabled": true,
+  "approvals": true,
+  "use_threads": true,
+  "rate_limit": 20,
+  "session_timeout": 1800,
+  "auto_delete_topics": false
+}
+```
+
+```bash
+chmod 600 ~/.config/claude-telegram-mirror/config.json
+```
+
+Or use the interactive wizard which validates your token and chat ID:
+
+```bash
+ctm setup
+```
+
+### Option B: Environment variables
 
 Create `~/.telegram-env`:
 
@@ -121,6 +170,8 @@ Source it in your shell profile (`~/.bashrc` or `~/.zshrc`):
 ```bash
 [[ -f ~/.telegram-env ]] && source ~/.telegram-env
 ```
+
+> **Note:** Environment variables take precedence over the config file. You can mix both — use the config file for stable settings and env vars for overrides.
 
 ### All Configuration Options
 
