@@ -185,21 +185,21 @@ sequenceDiagram
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Active: First hook event<br/>(auto-created)
+    [*] --> Active: First hook event
 
-    Active --> Active: Hook events<br/>update activity
+    Active --> Active: Hook events update activity
 
-    Active --> Ended: Stop event<br/>(turn complete)
+    Active --> Ended: Stop event
 
-    Ended --> Active: New hook event<br/>(reactivate)
+    Ended --> Active: New hook event (reactivate)
 
     Ended --> TopicClosed: auto_delete=false
     Ended --> PendingDeletion: auto_delete=true
 
     PendingDeletion --> TopicDeleted: delay expires
-    PendingDeletion --> Active: New event<br/>(cancel deletion)
+    PendingDeletion --> Active: New event (cancel deletion)
 
-    Active --> StaleCleanup: No tmux: 1h idle<br/>With tmux: 24h + pane dead
+    Active --> StaleCleanup: Idle timeout exceeded
 
     StaleCleanup --> TopicDeleted: auto_delete=true
     StaleCleanup --> TopicClosed: auto_delete=false
@@ -228,7 +228,7 @@ graph LR
     end
 
     C1 --> S1
-    C2 -->|"NDJSON\n"| S2
+    C2 -->|NDJSON lines| S2
     S2 --> S3
     S3 --> S4
 ```
@@ -378,7 +378,6 @@ erDiagram
         TEXT tmux_socket
         TEXT started_at
         TEXT last_activity
-        TEXT ended_at
     }
 
     pending_approvals {
@@ -388,7 +387,6 @@ erDiagram
         TEXT status
         TEXT created_at
         TEXT expires_at
-        TEXT resolved_at
     }
 
     sessions ||--o{ pending_approvals : "has"

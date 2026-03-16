@@ -169,9 +169,11 @@ fs.writeFileSync(pidFile, process.pid);  // TOCTOU gap!
 ```rust
 // Atomic: flock(2) is kernel-level, no race possible
 let file = fs::OpenOptions::new().write(true).create(true).open(&pid_path)?;
-match flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
-    Ok(()) => { /* We hold the lock */ }
-    Err(Errno::EWOULDBLOCK) => { /* Another process holds it */ }
+match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+    Ok(locked_file) => { /* We hold the lock */ }
+    Err((_, errno)) if errno == Errno::EWOULDBLOCK => {
+        /* Another process holds it */
+    }
 }
 ```
 

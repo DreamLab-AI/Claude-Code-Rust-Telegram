@@ -4,7 +4,7 @@ version = "0.2.1"
 edition = "2021"
 description = "Bidirectional Telegram integration for Claude Code CLI"
 license = "MIT"
-authors = ["Robert E. Lee <robert@agidreams.us>"]
+authors = ["John O'Hare <github@thedreamlab.uk>"]
 
 [[bin]]
 name = "ctm"
