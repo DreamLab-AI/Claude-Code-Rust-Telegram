@@ -1,938 +1,668 @@
+//! Message formatting and chunking for Telegram display.
+//!
+//! Ported from `formatting.ts` and `chunker.ts`.
+
 use regex::Regex;
 use std::sync::LazyLock;
 
-static ANSI_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").expect("valid regex"));
+/// Default maximum message length for Telegram (characters).
+/// Telegram's hard limit is 4096 but we use 4000 to leave room for part headers.
+#[allow(dead_code)] // Library API
+pub const DEFAULT_MAX_LENGTH: usize = 4000;
 
-/// Strip ANSI escape codes from text
+// ------------------------------------------------------------------- ANSI
+
+static ANSI_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").unwrap());
+
+/// Strip ANSI escape codes from text.
 pub fn strip_ansi(text: &str) -> String {
-    ANSI_RE.replace_all(text, "").to_string()
+    ANSI_RE.replace_all(text, "").into_owned()
 }
 
-/// Escape special characters for Telegram Markdown (not V2)
-/// Keeps code blocks intact
-#[allow(dead_code)]
-pub fn escape_markdown(text: &str) -> String {
-    // For basic Markdown mode, we only need minimal escaping
-    // Code blocks are already handled by the formatting functions
-    text.to_string()
+// ------------------------------------------------------------- MarkdownV2
+
+/// Characters that must be escaped outside code blocks.
+#[allow(dead_code)] // Used by escape_markdown_v2 (Library API)
+const MD_SPECIAL: &[char] = &[
+    '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!', '\\',
+];
+
+/// Escape MarkdownV2 special characters **outside** code blocks.
+///
+/// Code blocks (triple-backtick and single-backtick) are left untouched.
+#[allow(dead_code)] // Library API
+pub fn escape_markdown_v2(text: &str) -> String {
+    // Split on code blocks: ```...``` or `...`
+    // Regex captures code spans so they appear at odd indices.
+    static CODE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(```[\s\S]*?```|`[^`]+`)").unwrap());
+
+    let mut result = String::with_capacity(text.len() + text.len() / 4);
+    let mut last_end = 0;
+
+    for m in CODE_RE.find_iter(text) {
+        // Text before this code span — escape it.
+        let before = &text[last_end..m.start()];
+        escape_plain(before, &mut result);
+        // Code span — pass through untouched.
+        result.push_str(m.as_str());
+        last_end = m.end();
+    }
+    // Trailing plain text.
+    let tail = &text[last_end..];
+    escape_plain(tail, &mut result);
+
+    result
 }
 
-/// Format agent response for Telegram
+#[allow(dead_code)] // Used by escape_markdown_v2
+fn escape_plain(text: &str, out: &mut String) {
+    for ch in text.chars() {
+        if MD_SPECIAL.contains(&ch) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+}
+
+// -------------------------------------------------------- format helpers
+
 pub fn format_agent_response(content: &str) -> String {
     let cleaned = strip_ansi(content);
-    format!("\u{1f916} *Claude:*\n\n{}", cleaned)
+    format!("\u{1F916} *Claude:*\n\n{cleaned}")
 }
 
-/// Format tool execution for Telegram (used by Details button)
-#[allow(dead_code)]
 pub fn format_tool_execution(
     tool: &str,
     input: Option<&str>,
-    output: &str,
+    output: Option<&str>,
     verbose: bool,
 ) -> String {
-    let mut msg = format!("\u{1f527} *Tool: {}*\n", tool);
+    let mut msg = format!("\u{1F527} *Tool: {tool}*\n");
 
     if verbose {
         if let Some(inp) = input {
             let truncated = truncate(inp, 500);
-            msg.push_str(&format!("\n\u{1f4e5} Input:\n```\n{}\n```\n", truncated));
+            msg.push_str(&format!("\n\u{1F4E5} Input:\n```\n{truncated}\n```\n"));
         }
     }
 
-    if !output.is_empty() {
-        let truncated = truncate(&strip_ansi(output), 1000);
-        msg.push_str(&format!("\n\u{1f4e4} Output:\n```\n{}\n```", truncated));
+    if let Some(out) = output {
+        let cleaned = strip_ansi(&truncate(out, 1000));
+        msg.push_str(&format!("\n\u{1F4E4} Output:\n```\n{cleaned}\n```"));
     }
 
     msg
 }
 
-/// Format approval request for Telegram
 pub fn format_approval_request(prompt: &str) -> String {
-    format!(
-        "\u{26a0}\u{fe0f} *Approval Required*\n\n{}\n\nPlease respond:",
-        strip_ansi(prompt)
-    )
+    let cleaned = strip_ansi(prompt);
+    format!("\u{26A0}\u{FE0F} *Approval Required*\n\n{cleaned}\n\nPlease respond:")
 }
 
-/// Format session start notification
+pub fn format_error(error: &str) -> String {
+    let cleaned = strip_ansi(error);
+    format!("\u{274C} *Error:*\n\n```\n{cleaned}\n```")
+}
+
 pub fn format_session_start(
     session_id: &str,
     project_dir: Option<&str>,
     hostname: Option<&str>,
 ) -> String {
-    let mut msg = format!(
-        "\u{1f680} *Session Started*\n\nSession ID: `{}`",
-        session_id
-    );
-    if let Some(host) = hostname {
-        msg.push_str(&format!("\nHost: `{}`", host));
+    let mut msg = format!("\u{1F680} *Session Started*\n\nSession ID: `{session_id}`");
+    if let Some(h) = hostname {
+        msg.push_str(&format!("\nHost: `{h}`"));
     }
-    if let Some(dir) = project_dir {
-        msg.push_str(&format!("\nProject: `{}`", dir));
+    if let Some(p) = project_dir {
+        msg.push_str(&format!("\nProject: `{p}`"));
     }
     msg
 }
 
-/// Format session end notification
 pub fn format_session_end(session_id: &str, duration_ms: Option<u64>) -> String {
-    let mut msg = format!("\u{1f44b} *Session Ended*\n\nSession ID: `{}`", session_id);
-    if let Some(dur) = duration_ms {
-        let minutes = dur / 60000;
-        let seconds = (dur % 60000) / 1000;
-        msg.push_str(&format!("\nDuration: {}m {}s", minutes, seconds));
+    let mut msg = format!("\u{1F44B} *Session Ended*\n\nSession ID: `{session_id}`");
+    if let Some(d) = duration_ms {
+        let minutes = d / 60_000;
+        let seconds = (d % 60_000) / 1000;
+        msg.push_str(&format!("\nDuration: {minutes}m {seconds}s"));
     }
     msg
 }
 
-/// Format status message
-#[allow(dead_code)]
-pub fn format_status(is_active: bool, session_id: Option<&str>, muted: bool) -> String {
+#[allow(dead_code)] // Library API
+pub fn format_status(is_active: bool, session_id: Option<&str>, muted: Option<bool>) -> String {
     if !is_active {
-        return "\u{1f4ca} *Status*\n\nNo active session attached.".to_string();
+        return "\u{1F4CA} *Status*\n\nNo active session attached.".to_string();
     }
-    let mut msg = "\u{1f4ca} *Status*\n\n".to_string();
-    if let Some(sid) = session_id {
-        msg.push_str(&format!("Session: `{}`\n", sid));
-    }
-    msg.push_str(if muted {
-        "Notifications: \u{1f507} Muted"
+    let sid = session_id.unwrap_or("unknown");
+    let notif = if muted == Some(true) {
+        "\u{1F507} Muted"
     } else {
-        "Notifications: \u{1f514} Active"
-    });
-    msg
+        "\u{1F514} Active"
+    };
+    format!("\u{1F4CA} *Status*\n\nSession: `{sid}`\nNotifications: {notif}")
 }
 
-/// Format error message for Telegram
-pub fn format_error(error: &str) -> String {
-    format!("\u{274c} *Error:*\n\n```\n{}\n```", strip_ansi(error))
-}
-
-/// Format help message
 pub fn format_help() -> String {
-    "\u{1f4da} *Claude Code Mirror - Commands*\n\n\
-     /status - Show current session status\n\
-     /sessions - List active sessions\n\
-     /attach <id> - Attach to a session\n\
-     /detach - Detach from current session\n\
-     /mute - Mute notifications\n\
-     /unmute - Resume notifications\n\
-     /abort - Abort current session\n\
-     /help - Show this message\n\n\
-     *Inline Responses:*\n\
-     Simply reply with text to send input to the attached session.\n\n\
-     *Approval Buttons:*\n\
-     When Claude requests permission, tap:\n\
-     \u{2705} Approve - Allow the action\n\
-     \u{274c} Reject - Deny the action\n\
-     \u{1f6d1} Abort - End the session"
+    "\u{1F4DA} *Claude Code Mirror - Commands*
+
+/status - Show current session status
+/sessions - List active sessions
+/attach <id> - Attach to a session
+/detach - Detach from current session
+/mute - Mute notifications
+/unmute - Resume notifications
+/toggle - Toggle Telegram mirroring on/off
+/abort - Abort current session
+/help - Show this message
+
+*Inline Responses:*
+Simply reply with text to send input to the attached session.
+
+*Approval Buttons:*
+When Claude requests permission, tap:
+\u{2705} Approve - Allow the action
+\u{274C} Reject - Deny the action
+\u{1F6D1} Abort - End the session"
         .to_string()
 }
 
-/// Truncate text with ellipsis (UTF-8 safe)
-fn truncate(text: &str, max_len: usize) -> String {
-    if text.chars().count() <= max_len {
-        text.to_string()
-    } else {
-        let boundary = text
-            .char_indices()
-            .nth(max_len.saturating_sub(3))
-            .map(|(i, _)| i)
-            .unwrap_or(text.len());
-        format!("{}...", &text[..boundary])
-    }
-}
+// --------------------------------------------------------- tool details
 
-/// Get short filename from path
-fn short_path(path: &str) -> String {
-    let parts: Vec<&str> = path.split('/').collect();
-    // Absolute paths start with / so split gives ["", "a", "b"] for "/a/b"
-    if parts.len() <= 3 {
-        path.to_string()
-    } else {
-        format!(".../{}", parts[parts.len() - 2..].join("/"))
-    }
-}
-
-/// Format tool details for mobile-friendly Telegram display
 pub fn format_tool_details(tool: &str, input: &serde_json::Value) -> String {
-    let data = input.as_object();
-
     match tool {
         "Edit" => {
-            let file = data
-                .and_then(|d| d.get("file_path"))
-                .and_then(|v| v.as_str())
-                .map(short_path)
-                .unwrap_or_default();
-            let old_str = data
-                .and_then(|d| d.get("old_string"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let new_str = data
-                .and_then(|d| d.get("new_string"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let file = short_path(json_str(input, "file_path"));
+            let old = json_str(input, "old_string");
+            let new = json_str(input, "new_string");
 
-            let mut msg = format!("\u{270f}\u{fe0f} *Edit*\n\u{1f4c4} `{}`\n\n", file);
-            if !old_str.is_empty() {
+            let mut msg = format!("\u{270F}\u{FE0F} *Edit*\n\u{1F4C4} `{file}`\n\n");
+            if !old.is_empty() {
                 msg.push_str(&format!(
                     "\u{2796} *Remove:*\n```\n{}\n```\n\n",
-                    truncate(old_str, 800)
+                    truncate(old, 800)
                 ));
             }
-            if !new_str.is_empty() {
+            if !new.is_empty() {
                 msg.push_str(&format!(
                     "\u{2795} *Add:*\n```\n{}\n```",
-                    truncate(new_str, 800)
+                    truncate(new, 800)
                 ));
             }
             msg
         }
         "Write" => {
-            let file = data
-                .and_then(|d| d.get("file_path"))
-                .and_then(|v| v.as_str())
-                .map(short_path)
-                .unwrap_or_default();
-            let content = data
-                .and_then(|d| d.get("content"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let file = short_path(json_str(input, "file_path"));
+            let content = json_str(input, "content");
             let lines = content.lines().count();
             format!(
-                "\u{1f4dd} *Write*\n\u{1f4c4} `{}`\n\u{1f4cf} {} lines\n\n```\n{}\n```",
-                file,
-                lines,
+                "\u{1F4DD} *Write*\n\u{1F4C4} `{file}`\n\u{1F4CF} {lines} lines\n\n```\n{}\n```",
                 truncate(content, 1500)
             )
         }
         "Read" => {
-            let file = data
-                .and_then(|d| d.get("file_path"))
-                .and_then(|v| v.as_str())
-                .map(short_path)
-                .unwrap_or_default();
-            let mut msg = format!("\u{1f441} *Read*\n\u{1f4c4} `{}`", file);
-            if let Some(offset) = data.and_then(|d| d.get("offset")).and_then(|v| v.as_u64()) {
-                msg.push_str(&format!("\n\u{1f4cd} Line {}", offset));
+            let file = short_path(json_str(input, "file_path"));
+            let mut msg = format!("\u{1F441} *Read*\n\u{1F4C4} `{file}`");
+            if let Some(offset) = input.get("offset").and_then(|v| v.as_u64()) {
+                msg.push_str(&format!("\n\u{1F4CD} Line {offset}"));
             }
-            if let Some(limit) = data.and_then(|d| d.get("limit")).and_then(|v| v.as_u64()) {
-                msg.push_str(&format!(" (+{} lines)", limit));
+            if let Some(limit) = input.get("limit").and_then(|v| v.as_u64()) {
+                msg.push_str(&format!(" (+{limit} lines)"));
             }
             msg
         }
         "Bash" => {
-            let cmd = data
-                .and_then(|d| d.get("command"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let mut msg = format!("\u{1f4bb} *Bash*\n\n```bash\n{}\n```", truncate(cmd, 1500));
-            if let Some(timeout) = data.and_then(|d| d.get("timeout")).and_then(|v| v.as_u64()) {
-                msg.push_str(&format!("\n\u{23f1} Timeout: {}ms", timeout));
+            let cmd = json_str(input, "command");
+            let mut msg = format!("\u{1F4BB} *Bash*\n\n```bash\n{}\n```", truncate(cmd, 1500));
+            if let Some(t) = input.get("timeout").and_then(|v| v.as_u64()) {
+                msg.push_str(&format!("\n\u{23F1} Timeout: {t}ms"));
             }
             msg
         }
         "Grep" => {
-            let pattern = data
-                .and_then(|d| d.get("pattern"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let path = data
-                .and_then(|d| d.get("path"))
-                .and_then(|v| v.as_str())
-                .map(short_path)
-                .unwrap_or_else(|| "cwd".to_string());
+            let pattern = json_str(input, "pattern");
+            let path = if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
+                short_path(p)
+            } else {
+                "cwd".to_string()
+            };
             let mut msg = format!(
-                "\u{1f50d} *Grep*\n\u{1f3af} Pattern: `{}`\n\u{1f4c2} Path: `{}`",
-                truncate(pattern, 100),
-                path
+                "\u{1F50D} *Grep*\n\u{1F3AF} Pattern: `{}`\n\u{1F4C2} Path: `{path}`",
+                truncate(pattern, 100)
             );
-            if let Some(glob) = data.and_then(|d| d.get("glob")).and_then(|v| v.as_str()) {
-                msg.push_str(&format!("\n\u{1f4cb} Glob: `{}`", glob));
+            if let Some(g) = input.get("glob").and_then(|v| v.as_str()) {
+                msg.push_str(&format!("\n\u{1F4CB} Glob: `{g}`"));
             }
             msg
         }
+        "Glob" => {
+            let pattern = json_str(input, "pattern");
+            let path = if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
+                short_path(p)
+            } else {
+                "cwd".to_string()
+            };
+            format!("\u{1F4C2} *Glob*\n\u{1F3AF} Pattern: `{pattern}`\n\u{1F4C2} Path: `{path}`")
+        }
         "Task" => {
-            let desc = data
-                .and_then(|d| d.get("description"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let prompt = data
-                .and_then(|d| d.get("prompt"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let mut msg = format!("\u{1f916} *Task*\n\u{1f4cb} {}", desc);
+            let desc = json_str(input, "description");
+            let prompt = json_str(input, "prompt");
+            let mut msg = format!("\u{1F916} *Task*\n\u{1F4CB} {desc}");
             if !prompt.is_empty() {
                 msg.push_str(&format!("\n\n```\n{}\n```", truncate(prompt, 1000)));
+            }
+            msg
+        }
+        "WebFetch" => {
+            let url = json_str(input, "url");
+            let prompt = json_str(input, "prompt");
+            format!(
+                "\u{1F310} *WebFetch*\n\u{1F517} `{}`\n\u{1F4DD} {}",
+                truncate(url, 100),
+                truncate(prompt, 200)
+            )
+        }
+        "WebSearch" => {
+            let query = json_str(input, "query");
+            format!("\u{1F50E} *WebSearch*\n\u{1F4DD} \"{query}\"")
+        }
+        "TodoWrite" => {
+            let todos = input
+                .get("todos")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if todos.is_empty() {
+                return "\u{1F4CB} *TodoWrite*".to_string();
+            }
+            let mut msg = format!("\u{1F4CB} *TodoWrite* ({} items)\n\n", todos.len());
+            for todo in todos.iter().take(10) {
+                let status = todo
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("pending");
+                let content = todo.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let emoji = match status {
+                    "in_progress" => "\u{1F504}",
+                    "completed" => "\u{2705}",
+                    _ => "\u{2B1C}",
+                };
+                msg.push_str(&format!("{emoji} {}\n", truncate(content, 60)));
+            }
+            if todos.len() > 10 {
+                msg.push_str(&format!("... +{} more", todos.len() - 10));
             }
             msg
         }
         _ => {
             let json_str = serde_json::to_string_pretty(input).unwrap_or_default();
             format!(
-                "\u{1f527} *{}*\n\n```json\n{}\n```",
-                tool,
+                "\u{1F527} *{tool}*\n\n```json\n{}\n```",
                 truncate(&json_str, 2000)
             )
         }
     }
 }
 
-/// Split a message into chunks that fit Telegram's 4096 char limit
-#[allow(dead_code)]
-pub fn chunk_message(text: &str, max_length: usize) -> Vec<String> {
-    if text.len() <= max_length {
+fn json_str<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
+    v.get(key).and_then(|v| v.as_str()).unwrap_or("")
+}
+
+// --------------------------------------------------- language detection
+
+/// Heuristic code-language detection.
+#[allow(dead_code)] // Library API
+pub fn detect_language(content: &str) -> &'static str {
+    let trimmed = content.trim();
+    type LangCheck = (&'static str, fn(&str) -> bool);
+    // L4.7: TypeScript is checked before JavaScript because TS-specific
+    // patterns (type annotations, interface/type keywords) should match first.
+    // JavaScript detection now also handles minified `import{` without space.
+    let patterns: &[LangCheck] = &[
+        ("typescript", |t: &str| {
+            t.contains(": string")
+                || t.contains(": number")
+                || t.contains(": boolean")
+                || t.starts_with("interface ")
+                || t.starts_with("type ")
+                || t.contains("as const")
+        }),
+        ("javascript", |t: &str| {
+            t.starts_with("#!/usr/bin/env node")
+                || ((t.starts_with("import ") || t.starts_with("import{"))
+                    && (t.contains("from '") || t.contains("from \"")))
+                || (t.starts_with("const ") && t.contains(" = require("))
+        }),
+        ("python", |t: &str| {
+            t.starts_with("#!/usr/bin/env python")
+                || t.starts_with("import ")
+                || (t.starts_with("from ") && t.contains(" import "))
+                || t.starts_with("def ")
+        }),
+        ("go", |t: &str| {
+            t.starts_with("package ") || t.starts_with("import \"") || t.starts_with("func ")
+        }),
+        ("rust", |t: &str| {
+            t.starts_with("use ")
+                || t.starts_with("fn ")
+                || t.starts_with("let mut ")
+                || t.starts_with("impl ")
+        }),
+        ("cpp", |t: &str| {
+            t.starts_with("#include ") || t.starts_with("int main(") || t.starts_with("void ")
+        }),
+        ("bash", |t: &str| {
+            t.starts_with("$ ") || t.starts_with("#!") || (t.starts_with('#') && t.contains("bash"))
+        }),
+        ("json", |t: &str| {
+            (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']'))
+        }),
+        ("xml", |t: &str| {
+            t.starts_with("<?xml") || t.starts_with("<!DOCTYPE") || t.starts_with("<html")
+        }),
+    ];
+
+    for &(lang, check) in patterns {
+        if check(trimmed) {
+            return lang;
+        }
+    }
+    ""
+}
+
+#[allow(dead_code)] // Library API
+pub fn wrap_in_code_block(content: &str, language: Option<&str>) -> String {
+    let lang = language.unwrap_or_else(|| detect_language(content));
+    format!("```{lang}\n{content}\n```")
+}
+
+// ------------------------------------------------------------- truncate
+
+/// UTF-8 safe truncation with ellipsis.
+///
+/// If `text` has more than `max_len` characters, it is truncated and an
+/// ellipsis (`...`) is appended. The returned string is at most `max_len`
+/// characters long.
+///
+/// # Examples
+///
+/// ```
+/// use ctm::formatting::truncate;
+///
+/// // Short strings are returned unchanged.
+/// assert_eq!(truncate("hello", 10), "hello");
+///
+/// // Long strings are truncated with an ellipsis.
+/// assert_eq!(truncate("hello world", 8), "hello...");
+/// ```
+pub fn truncate(text: &str, max_len: usize) -> String {
+    if max_len < 4 {
+        // Below minimum useful length — return what fits without ellipsis.
+        return text.chars().take(max_len).collect();
+    }
+    let char_count = text.chars().count();
+    if char_count <= max_len {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(max_len - 3).collect();
+    format!("{truncated}...")
+}
+
+/// Estimate the number of chunks needed to fit `text` within `max_length`.
+///
+/// Uses character count (not byte length) for consistency with `truncate()`
+/// and Telegram's character-based message limits.
+#[allow(dead_code)] // Library API
+pub fn estimate_chunks(text: &str, max_length: usize) -> usize {
+    let char_count = text.chars().count();
+    if char_count <= max_length {
+        1
+    } else {
+        char_count.div_ceil(max_length)
+    }
+}
+
+/// Returns `true` if `text` exceeds `max_length` characters and will need chunking.
+///
+/// Uses character count (not byte length) for consistency with `truncate()`
+/// and Telegram's character-based message limits.
+#[allow(dead_code)] // Library API
+pub fn needs_chunking(text: &str, max_length: usize) -> bool {
+    text.chars().count() > max_length
+}
+
+/// Last 2 path components with `.../` prefix.
+///
+/// Empty path components (e.g. from `//foo/bar`) are filtered out, which is an
+/// intentional improvement over the TypeScript version that did not handle
+/// consecutive separators gracefully.
+///
+/// # Examples
+///
+/// ```
+/// use ctm::formatting::short_path;
+///
+/// // Long paths are shortened to the last two components.
+/// assert_eq!(short_path("/opt/project/src/utils/config.ts"), ".../utils/config.ts");
+///
+/// // Paths with two or fewer components are returned as-is.
+/// assert_eq!(short_path("/src/file.ts"), "/src/file.ts");
+/// ```
+pub fn short_path(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() <= 2 {
+        return path.to_string();
+    }
+    format!(".../{}", parts[parts.len() - 2..].join("/"))
+}
+
+// -------------------------------------------------------- message chunking
+
+/// Options for `chunk_message_with_options`.
+pub struct ChunkOptions {
+    /// Maximum character length per chunk (default: 4000).
+    pub max_length: usize,
+    /// Whether to avoid splitting inside triple-backtick code blocks (default: true).
+    pub preserve_code_blocks: bool,
+    /// Whether to prepend "Part N/M" headers to multi-chunk output (default: true).
+    pub add_part_headers: bool,
+}
+
+impl Default for ChunkOptions {
+    fn default() -> Self {
+        Self {
+            max_length: 4000,
+            preserve_code_blocks: true,
+            add_part_headers: true,
+        }
+    }
+}
+
+/// Chunk a message using explicit `ChunkOptions`.
+///
+/// - Code-block aware: never splits inside ` ``` ` blocks (when `preserve_code_blocks` is true).
+/// - Uses natural break points (double newline > single newline > period+space > space).
+/// - Adds "Part N/M" headers when multi-chunk (when `add_part_headers` is true).
+pub fn chunk_message_with_options(text: &str, opts: &ChunkOptions) -> Vec<String> {
+    let max_length = opts.max_length;
+
+    // Bug 1 fix: use character count, not byte length.
+    if text.chars().count() <= max_length {
         return vec![text.to_string()];
     }
 
-    let mut chunks = Vec::new();
-    let mut current = String::new();
+    let code_blocks = if opts.preserve_code_blocks {
+        find_code_blocks(text)
+    } else {
+        Vec::new()
+    };
 
-    for line in text.lines() {
-        if current.len() + line.len() + 1 > max_length {
-            if !current.is_empty() {
-                chunks.push(current);
-                current = String::new();
-            }
-            // If single line exceeds max, split it (UTF-8 safe)
-            if line.len() > max_length {
-                let mut remaining = line;
-                while remaining.len() > max_length {
-                    // Find a char boundary at or before max_length
-                    let boundary = remaining
-                        .char_indices()
-                        .take_while(|(i, _)| *i <= max_length)
-                        .last()
-                        .map(|(i, _)| i)
-                        .unwrap_or(remaining.len());
-                    let (chunk, rest) = remaining.split_at(boundary);
-                    chunks.push(chunk.to_string());
-                    remaining = rest;
-                }
-                if !remaining.is_empty() {
-                    current = remaining.to_string();
-                }
-            } else {
-                current = line.to_string();
-            }
-        } else {
-            if !current.is_empty() {
-                current.push('\n');
-            }
-            current.push_str(line);
+    // Bug 3 fix: reserve space for part headers BEFORE splitting so that
+    // the header does not push any chunk over max_length.
+    // Header format: "📄 *Part N/M*\n\n" — we conservatively reserve 30 chars.
+    // We only apply the overhead when headers are actually requested, and we
+    // do a two-pass approach: first split with effective_max, then add headers.
+    let header_overhead: usize = if opts.add_part_headers { 30 } else { 0 };
+    let effective_max = max_length.saturating_sub(header_overhead);
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut remaining = text;
+    let mut offset = 0usize;
+
+    while !remaining.is_empty() {
+        // Bug 1 fix: use character count, not byte length.
+        if remaining.chars().count() <= effective_max {
+            chunks.push(remaining.to_string());
+            break;
         }
+
+        let split = find_best_split_point(remaining, effective_max, &code_blocks, offset);
+        let chunk = remaining[..split].trim_end().to_string();
+
+        // Bug 4 fix: account for bytes consumed by trim_start() when advancing offset.
+        let after_split = &remaining[split..];
+        let trimmed = after_split.trim_start();
+        let trim_bytes = after_split.len() - trimmed.len();
+        remaining = trimmed;
+        offset += split + trim_bytes;
+
+        chunks.push(chunk);
     }
 
-    if !current.is_empty() {
-        chunks.push(current);
+    if opts.add_part_headers && chunks.len() > 1 {
+        let total = chunks.len();
+        chunks = chunks
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| format!("\u{1F4C4} *Part {}/{}*\n\n{c}", i + 1, total))
+            .collect();
     }
 
     chunks
 }
 
-/// Truncate file path to show basename and parent
-#[allow(dead_code)]
-pub fn truncate_path(path: &str) -> String {
-    let parts: Vec<&str> = path.split('/').collect();
-    if parts.len() <= 3 {
-        path.to_string()
-    } else {
-        format!(".../{}", parts[parts.len() - 2..].join("/"))
-    }
+/// Chunk a message into pieces that fit Telegram's 4096-char limit.
+///
+/// Convenience wrapper around `chunk_message_with_options` using default options.
+pub fn chunk_message(text: &str, max_length: usize) -> Vec<String> {
+    chunk_message_with_options(
+        text,
+        &ChunkOptions {
+            max_length,
+            ..ChunkOptions::default()
+        },
+    )
 }
 
-/// Get just the filename from a path
-fn basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+/// Strip ANSI codes from `content` and split into Telegram-sized chunks.
+///
+/// Combines `strip_ansi` and `chunk_message` in a single convenient call.
+/// Uses `DEFAULT_MAX_LENGTH` when `max_length` is `None`.
+#[allow(dead_code)] // Library API
+pub fn format_and_chunk(content: &str, max_length: Option<usize>) -> Vec<String> {
+    let cleaned = strip_ansi(content);
+    chunk_message(&cleaned, max_length.unwrap_or(DEFAULT_MAX_LENGTH))
 }
 
-/// Summarize a tool action in natural, human-readable language.
-/// Returns a one-liner suitable for Telegram notification.
-pub fn summarize_tool_action(tool: &str, input: Option<&serde_json::Value>) -> String {
-    let obj = input.and_then(|v| v.as_object());
-
-    match tool {
-        "Bash" => summarize_bash(obj),
-        "Read" => {
-            let file = obj
-                .and_then(|o| o.get("file_path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("a file");
-            format!("Reading {}", basename(file))
-        }
-        "Write" => {
-            let file = obj
-                .and_then(|o| o.get("file_path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("a file");
-            format!("Creating {}", basename(file))
-        }
-        "Edit" => {
-            let file = obj
-                .and_then(|o| o.get("file_path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("a file");
-            format!("Editing {}", basename(file))
-        }
-        "MultiEdit" => {
-            let file = obj
-                .and_then(|o| o.get("file_path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("a file");
-            format!("Editing {} (multiple changes)", basename(file))
-        }
-        "Grep" => {
-            let pattern = obj
-                .and_then(|o| o.get("pattern"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("a pattern");
-            let short: String = pattern.chars().take(40).collect();
-            format!("Searching for '{}'", short)
-        }
-        "Glob" => {
-            let pattern = obj
-                .and_then(|o| o.get("pattern"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("files");
-            format!("Finding files matching {}", pattern)
-        }
-        "Task" => {
-            let desc = obj
-                .and_then(|o| o.get("description"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("a subtask");
-            format!("Delegating: {}", desc)
-        }
-        "WebSearch" => {
-            let query = obj
-                .and_then(|o| o.get("query"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("the web");
-            let short: String = query.chars().take(50).collect();
-            format!("Searching web for '{}'", short)
-        }
-        "WebFetch" => {
-            let url = obj
-                .and_then(|o| o.get("url"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("a page");
-            // Show just the domain
-            let domain = url
-                .strip_prefix("https://")
-                .or_else(|| url.strip_prefix("http://"))
-                .and_then(|s| s.split('/').next())
-                .unwrap_or(url);
-            format!("Fetching content from {}", domain)
-        }
-        "NotebookEdit" => "Editing notebook".to_string(),
-        "TodoWrite" | "TodoRead" => "Managing task list".to_string(),
-        "AskUser" | "AskUserQuestion" => "Asking for input".to_string(),
-        _ => format!("Using {}", tool),
-    }
+/// Find triple-backtick code block positions.
+struct CodeBlock {
+    start: usize,
+    end: usize,
 }
 
-/// Given a chained command (e.g. `sleep 5 && cargo test`), find the most
-/// meaningful segment by skipping trivial commands like sleep, cd, true, echo.
-fn find_meaningful_command(cmd: &str) -> &str {
-    // Split on &&, ||, ; (but not inside quotes)
-    let separators = ["&&", "||", ";"];
-    let segments: Vec<&str> = {
-        let mut segs = vec![cmd];
-        for sep in &separators {
-            segs = segs.into_iter().flat_map(|s| s.split(sep)).collect();
-        }
-        segs.into_iter()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect()
-    };
+fn find_code_blocks(text: &str) -> Vec<CodeBlock> {
+    static CB_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"```[\s\S]*?```").unwrap());
 
-    // Trivial commands to skip when a more meaningful alternative exists
-    let trivial = [
-        "sleep", "wait", "true", "false", "echo", "printf", "cd", "pushd", "popd", "export", "set",
-        "unset", ":", "test", "[",
-    ];
+    CB_RE
+        .find_iter(text)
+        .map(|m| CodeBlock {
+            start: m.start(),
+            end: m.end(),
+        })
+        .collect()
+}
 
-    // Find first non-trivial segment
-    for seg in &segments {
-        // For piped commands, take the first part of the pipe
-        let first_part = seg.split('|').next().unwrap_or(seg).trim();
-        let first_word = first_part.split_whitespace().next().unwrap_or("");
-        if !trivial.contains(&first_word) {
-            return first_part;
+fn is_inside_code_block(pos: usize, blocks: &[CodeBlock]) -> bool {
+    blocks.iter().any(|b| pos > b.start && pos < b.end)
+}
+
+/// Convert a character position to a byte position within `text`.
+///
+/// Returns the byte index at which the character at position `char_pos` starts.
+/// If `char_pos` is beyond the end of `text`, returns `text.len()`.
+fn char_pos_to_byte_pos(text: &str, char_pos: usize) -> usize {
+    text.char_indices()
+        .nth(char_pos)
+        .map(|(byte_idx, _)| byte_idx)
+        .unwrap_or(text.len())
+}
+
+/// Find the best byte-offset split point in `text` near the given `target`
+/// character position.
+///
+/// - `target`        : desired split position in **characters**.
+/// - `blocks`        : code-block byte ranges in the full original text.
+/// - `global_offset` : byte offset of `text` within the original full text.
+///
+/// Returns a **byte** index into `text` that is guaranteed to be on a UTF-8
+/// character boundary and safe to use for slicing.
+fn find_best_split_point(
+    text: &str,
+    target: usize,
+    blocks: &[CodeBlock],
+    global_offset: usize,
+) -> usize {
+    // Convert target character position to a byte position in `text`.
+    let target_byte = char_pos_to_byte_pos(text, target);
+
+    // If target_byte falls inside a code block, split before or after the block.
+    for block in blocks {
+        let local_start = block.start.saturating_sub(global_offset);
+        let local_end = block.end.saturating_sub(global_offset);
+        if target_byte > local_start && target_byte < local_end {
+            if local_start > 100 {
+                return local_start;
+            }
+            return std::cmp::min(local_end, text.len());
         }
     }
 
-    // All segments are trivial — return the last one
-    segments.last().unwrap_or(&cmd)
-}
+    // Search for natural break points near target_byte, but only at char boundaries.
+    // We restrict the search window to [search_start_byte .. search_end_byte].
+    let search_start_char = target.saturating_sub(200);
+    let search_start_byte = char_pos_to_byte_pos(text, search_start_char);
+    let search_end_byte = std::cmp::min(text.len(), char_pos_to_byte_pos(text, target + 50));
 
-/// Summarize a Bash command into human-readable form
-fn summarize_bash(obj: Option<&serde_json::Map<String, serde_json::Value>>) -> String {
-    let cmd = match obj.and_then(|o| o.get("command")).and_then(|v| v.as_str()) {
-        Some(c) => c.trim(),
-        None => return "Running a command".to_string(),
-    };
+    // Guard: search window must be valid.
+    if search_start_byte >= search_end_byte || search_end_byte > text.len() {
+        return target_byte;
+    }
 
-    // For chained commands (&&, ;, |), find the most meaningful segment
-    let meaningful_cmd = find_meaningful_command(cmd);
-    let first_word = meaningful_cmd.split_whitespace().next().unwrap_or("");
+    let search_text = &text[search_start_byte..search_end_byte];
 
-    match first_word {
-        "cargo" => summarize_cargo(meaningful_cmd),
-        "git" => summarize_git(meaningful_cmd),
-        "npm" | "npx" | "yarn" | "pnpm" | "bun" => summarize_node(meaningful_cmd),
-        "pip" | "pip3" | "python" | "python3" | "pytest" => summarize_python(meaningful_cmd),
-        "rustc" | "rustup" => format!("Running {}", first_word),
-        "docker" | "docker-compose" => summarize_docker(meaningful_cmd),
-        "make" => {
-            let target = meaningful_cmd
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or("default");
-            format!("Running make {}", target)
-        }
-        "curl" => "Making HTTP request".to_string(),
-        "wget" => "Downloading file".to_string(),
-        "chmod" => "Changing file permissions".to_string(),
-        "chown" => "Changing file ownership".to_string(),
-        "mkdir" => "Creating directory".to_string(),
-        "rm" => "Removing files".to_string(),
-        "cp" => "Copying files".to_string(),
-        "mv" => "Moving files".to_string(),
-        "ln" => "Creating symlink".to_string(),
-        "tar" => {
-            if meaningful_cmd.contains('x') {
-                "Extracting archive".to_string()
-            } else {
-                "Creating archive".to_string()
+    // Break patterns ordered by preference.  `pat_len` is the byte length of
+    // the portion we want to include *before* the split (i.e. we split after
+    // the delimiter, consuming `after_pat` bytes of the delimiter).
+    let break_patterns: &[(&str, usize)] = &[("\n\n", 2), ("\n", 1), (". ", 2), (" ", 1)];
+
+    for &(pat, after_pat) in break_patterns {
+        let mut best: Option<usize> = None;
+        for (i, _) in search_text.match_indices(pat) {
+            // `i` is a byte offset within `search_text`, which is a slice of
+            // `text` starting at `search_start_byte`.
+            let abs_byte = search_start_byte + i + after_pat;
+            // Only accept positions at or before target_byte so we never
+            // exceed the character budget.
+            if abs_byte <= target_byte && !is_inside_code_block(abs_byte + global_offset, blocks) {
+                best = Some(abs_byte);
             }
         }
-        "ssh" => "Connecting via SSH".to_string(),
-        "tmux" => "Managing tmux session".to_string(),
-        "supervisorctl" => "Managing services".to_string(),
-        "kill" | "killall" | "pkill" => "Stopping process".to_string(),
-        "ps" => "Listing processes".to_string(),
-        "ls" => "Listing directory".to_string(),
-        "nohup" | "timeout" | "env" | "nice" | "sudo" => {
-            // Skip wrapper commands and recurse on the inner command
-            let inner = meaningful_cmd
-                .split_once(char::is_whitespace)
-                .map(|x| x.1)
-                .unwrap_or("");
-            let inner_first = inner.split_whitespace().next().unwrap_or("");
-            if !inner_first.is_empty() && inner_first != first_word {
-                summarize_bash(Some(&serde_json::Map::from_iter([(
-                    "command".to_string(),
-                    serde_json::Value::String(inner.to_string()),
-                )])))
-            } else {
-                format!("Running {}", first_word)
-            }
-        }
-        "sleep" | "wait" | "true" | "echo" | "printf" | "cat" | "head" | "tail" | "wc" | "sort"
-        | "uniq" | "tee" | "tr" | "cut" | "sed" | "awk" | "grep" | "pgrep" | "xargs" => {
-            // Utility commands — summarize tersely
-            let short: String = meaningful_cmd.chars().take(50).collect();
-            let ellipsis = if meaningful_cmd.chars().count() > 50 {
-                "..."
-            } else {
-                ""
-            };
-            format!("Running `{}{}`", short, ellipsis)
-        }
-        _ => {
-            let short: String = meaningful_cmd.chars().take(50).collect();
-            let ellipsis = if meaningful_cmd.chars().count() > 50 {
-                "..."
-            } else {
-                ""
-            };
-            format!("Running `{}{}`", short, ellipsis)
+        if let Some(b) = best {
+            return b;
         }
     }
-}
 
-fn summarize_cargo(cmd: &str) -> String {
-    let subcmd = cmd.split_whitespace().nth(1).unwrap_or("");
-    match subcmd {
-        "build" => {
-            if cmd.contains("--release") {
-                "Building project (release)".to_string()
-            } else {
-                "Building project".to_string()
-            }
-        }
-        "test" => {
-            // Extract test name if specified
-            let parts: Vec<&str> = cmd.split_whitespace().collect();
-            let test_name = parts.iter().skip(2).find(|p| !p.starts_with('-'));
-            match test_name {
-                Some(name) => format!("Running test: {}", name),
-                None => "Running tests".to_string(),
-            }
-        }
-        "clippy" => "Running linter (clippy)".to_string(),
-        "fmt" => "Formatting code".to_string(),
-        "check" => "Checking code".to_string(),
-        "run" => "Running program".to_string(),
-        "add" => {
-            let dep = cmd.split_whitespace().nth(2).unwrap_or("dependency");
-            format!("Adding dependency: {}", dep)
-        }
-        "install" => "Installing Rust package".to_string(),
-        "clean" => "Cleaning build artifacts".to_string(),
-        "doc" => "Generating documentation".to_string(),
-        "publish" => "Publishing crate".to_string(),
-        "bench" => "Running benchmarks".to_string(),
-        _ => format!("Running cargo {}", subcmd),
-    }
-}
-
-fn summarize_git(cmd: &str) -> String {
-    let subcmd = cmd.split_whitespace().nth(1).unwrap_or("");
-    match subcmd {
-        "status" => "Checking git status".to_string(),
-        "diff" => "Viewing changes".to_string(),
-        "log" => "Viewing commit history".to_string(),
-        "add" => "Staging changes".to_string(),
-        "commit" => "Committing changes".to_string(),
-        "push" => "Pushing to remote".to_string(),
-        "pull" => "Pulling from remote".to_string(),
-        "fetch" => "Fetching updates".to_string(),
-        "checkout" | "switch" => {
-            let branch = cmd.split_whitespace().nth(2).unwrap_or("branch");
-            format!("Switching to {}", branch)
-        }
-        "branch" => "Managing branches".to_string(),
-        "merge" => "Merging branches".to_string(),
-        "rebase" => "Rebasing commits".to_string(),
-        "stash" => "Stashing changes".to_string(),
-        "clone" => "Cloning repository".to_string(),
-        "init" => "Initializing repository".to_string(),
-        "tag" => "Managing tags".to_string(),
-        "remote" => "Managing remotes".to_string(),
-        _ => format!("Running git {}", subcmd),
-    }
-}
-
-fn summarize_node(cmd: &str) -> String {
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
-    let manager = parts.first().unwrap_or(&"npm");
-    let subcmd = parts.get(1).unwrap_or(&"");
-    match *subcmd {
-        "install" | "i" | "add" => "Installing dependencies".to_string(),
-        "test" | "t" => "Running tests".to_string(),
-        "run" => {
-            let script = parts.get(2).unwrap_or(&"script");
-            format!("Running {} {}", manager, script)
-        }
-        "build" => "Building project".to_string(),
-        "start" => "Starting application".to_string(),
-        "lint" => "Running linter".to_string(),
-        "publish" => "Publishing package".to_string(),
-        _ => {
-            if *manager == "npx" {
-                let pkg = parts.get(1).unwrap_or(&"package");
-                format!("Running {}", pkg)
-            } else {
-                format!("Running {} {}", manager, subcmd)
-            }
-        }
-    }
-}
-
-fn summarize_python(cmd: &str) -> String {
-    let first = cmd.split_whitespace().next().unwrap_or("");
-    match first {
-        "pytest" => "Running Python tests".to_string(),
-        "pip" | "pip3" => {
-            if cmd.contains("install") {
-                "Installing Python packages".to_string()
-            } else {
-                "Managing Python packages".to_string()
-            }
-        }
-        _ => "Running Python script".to_string(),
-    }
-}
-
-fn summarize_docker(cmd: &str) -> String {
-    let subcmd = cmd.split_whitespace().nth(1).unwrap_or("");
-    match subcmd {
-        "build" => "Building Docker image".to_string(),
-        "run" => "Running Docker container".to_string(),
-        "compose" | "-compose" => {
-            let action = cmd.split_whitespace().nth(2).unwrap_or("up");
-            format!("Docker compose {}", action)
-        }
-        "push" => "Pushing Docker image".to_string(),
-        "pull" => "Pulling Docker image".to_string(),
-        "exec" => "Running command in container".to_string(),
-        "stop" => "Stopping container".to_string(),
-        "ps" => "Listing containers".to_string(),
-        _ => format!("Running docker {}", subcmd),
-    }
-}
-
-/// Summarize a tool result in human-readable form.
-/// Returns a brief one-liner for the result notification.
-pub fn summarize_tool_result(tool: &str, output: &str) -> String {
-    let cleaned = strip_ansi(output);
-    let line_count = cleaned.lines().count();
-
-    // Check for obvious error patterns
-    let is_error = cleaned.contains("error[E")
-        || cleaned.contains("Error:")
-        || cleaned.contains("FAILED")
-        || cleaned.contains("panic!")
-        || cleaned.starts_with("error");
-
-    if is_error {
-        // Extract first error line
-        let first_err = cleaned
-            .lines()
-            .find(|l| l.contains("error") || l.contains("Error") || l.contains("FAILED"))
-            .unwrap_or("See details");
-        let short: String = first_err.chars().take(80).collect();
-        return format!("Failed: {}", short);
-    }
-
-    match tool {
-        "Bash" => {
-            if cleaned.is_empty() {
-                "Completed (no output)".to_string()
-            } else if line_count == 1 {
-                let short: String = cleaned.trim().chars().take(80).collect();
-                format!("Result: {}", short)
-            } else {
-                format!("Completed ({} lines of output)", line_count)
-            }
-        }
-        "Read" => format!("Read {} lines", line_count),
-        "Write" => "File written".to_string(),
-        "Edit" | "MultiEdit" => "Changes applied".to_string(),
-        "Grep" => {
-            if cleaned.is_empty() {
-                "No matches found".to_string()
-            } else {
-                let matches = cleaned.lines().count();
-                format!(
-                    "Found {} match{}",
-                    matches,
-                    if matches == 1 { "" } else { "es" }
-                )
-            }
-        }
-        "Glob" => {
-            let files = cleaned.lines().count();
-            format!("Found {} file{}", files, if files == 1 { "" } else { "s" })
-        }
-        "Task" => "Subtask completed".to_string(),
-        "WebSearch" => "Search results received".to_string(),
-        "WebFetch" => "Content fetched".to_string(),
-        _ => {
-            if cleaned.is_empty() {
-                "Completed".to_string()
-            } else {
-                format!("Completed ({} lines)", line_count)
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_strip_ansi() {
-        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
-        assert_eq!(strip_ansi("no ansi"), "no ansi");
-    }
-
-    #[test]
-    fn test_truncate() {
-        assert_eq!(truncate("short", 10), "short");
-        assert_eq!(truncate("this is a long string", 10), "this is...");
-    }
-
-    #[test]
-    fn test_short_path() {
-        assert_eq!(short_path("/a/b"), "/a/b");
-        assert_eq!(short_path("/a/b/c/d/e.rs"), ".../d/e.rs");
-    }
-
-    #[test]
-    fn test_chunk_message() {
-        let text = "line1\nline2\nline3";
-        let chunks = chunk_message(text, 100);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], text);
-
-        let chunks = chunk_message(text, 10);
-        assert!(chunks.len() > 1);
-    }
-
-    #[test]
-    fn test_summarize_bash_cargo() {
-        let input = serde_json::json!({"command": "cargo test"});
-        assert_eq!(summarize_tool_action("Bash", Some(&input)), "Running tests");
-
-        let input = serde_json::json!({"command": "cargo build --release"});
-        assert_eq!(
-            summarize_tool_action("Bash", Some(&input)),
-            "Building project (release)"
-        );
-
-        let input = serde_json::json!({"command": "cargo clippy"});
-        assert_eq!(
-            summarize_tool_action("Bash", Some(&input)),
-            "Running linter (clippy)"
-        );
-
-        let input = serde_json::json!({"command": "cargo fmt"});
-        assert_eq!(
-            summarize_tool_action("Bash", Some(&input)),
-            "Formatting code"
-        );
-    }
-
-    #[test]
-    fn test_summarize_bash_git() {
-        let input = serde_json::json!({"command": "git status"});
-        assert_eq!(
-            summarize_tool_action("Bash", Some(&input)),
-            "Checking git status"
-        );
-
-        let input = serde_json::json!({"command": "git push"});
-        assert_eq!(
-            summarize_tool_action("Bash", Some(&input)),
-            "Pushing to remote"
-        );
-
-        let input = serde_json::json!({"command": "git diff"});
-        assert_eq!(
-            summarize_tool_action("Bash", Some(&input)),
-            "Viewing changes"
-        );
-    }
-
-    #[test]
-    fn test_summarize_file_ops() {
-        let input = serde_json::json!({"file_path": "/home/user/project/src/main.rs"});
-        assert_eq!(
-            summarize_tool_action("Read", Some(&input)),
-            "Reading main.rs"
-        );
-        assert_eq!(
-            summarize_tool_action("Edit", Some(&input)),
-            "Editing main.rs"
-        );
-        assert_eq!(
-            summarize_tool_action("Write", Some(&input)),
-            "Creating main.rs"
-        );
-    }
-
-    #[test]
-    fn test_summarize_search() {
-        let input = serde_json::json!({"pattern": "fn main"});
-        assert_eq!(
-            summarize_tool_action("Grep", Some(&input)),
-            "Searching for 'fn main'"
-        );
-
-        let input = serde_json::json!({"pattern": "**/*.rs"});
-        assert_eq!(
-            summarize_tool_action("Glob", Some(&input)),
-            "Finding files matching **/*.rs"
-        );
-    }
-
-    #[test]
-    fn test_summarize_task() {
-        let input = serde_json::json!({"description": "Explore auth module"});
-        assert_eq!(
-            summarize_tool_action("Task", Some(&input)),
-            "Delegating: Explore auth module"
-        );
-    }
-
-    #[test]
-    fn test_summarize_unknown_tool() {
-        let input = serde_json::json!({"foo": "bar"});
-        assert_eq!(
-            summarize_tool_action("CustomTool", Some(&input)),
-            "Using CustomTool"
-        );
-    }
-
-    #[test]
-    fn test_summarize_tool_result_success() {
-        assert_eq!(summarize_tool_result("Bash", ""), "Completed (no output)");
-        assert_eq!(summarize_tool_result("Bash", "ok"), "Result: ok");
-        assert_eq!(
-            summarize_tool_result("Bash", "line1\nline2\nline3"),
-            "Completed (3 lines of output)"
-        );
-        assert_eq!(summarize_tool_result("Write", "ok"), "File written");
-        assert_eq!(summarize_tool_result("Edit", "ok"), "Changes applied");
-        assert_eq!(summarize_tool_result("Grep", ""), "No matches found");
-        assert_eq!(summarize_tool_result("Grep", "a\nb"), "Found 2 matches");
-    }
-
-    #[test]
-    fn test_summarize_tool_result_error() {
-        assert!(
-            summarize_tool_result("Bash", "error[E0433]: use of undeclared type")
-                .starts_with("Failed:")
-        );
-        assert!(summarize_tool_result("Bash", "Error: file not found").starts_with("Failed:"));
-    }
-
-    #[test]
-    fn test_find_meaningful_command() {
-        // Skips trivial prefixes
-        assert_eq!(
-            find_meaningful_command("sleep 5 && cargo test"),
-            "cargo test"
-        );
-        assert_eq!(
-            find_meaningful_command("cd /tmp && git status"),
-            "git status"
-        );
-        assert_eq!(
-            find_meaningful_command("export FOO=bar && npm run build"),
-            "npm run build"
-        );
-
-        // Returns whole command if no chain
-        assert_eq!(
-            find_meaningful_command("cargo build --release"),
-            "cargo build --release"
-        );
-
-        // All trivial — returns last
-        assert_eq!(find_meaningful_command("cd /tmp && echo done"), "echo done");
-
-        // Semicolons work too
-        assert_eq!(find_meaningful_command("sleep 1; cargo test"), "cargo test");
-    }
-
-    #[test]
-    fn test_summarize_chained_bash() {
-        let input = serde_json::json!({"command": "sleep 5 && cargo test"});
-        assert_eq!(summarize_tool_action("Bash", Some(&input)), "Running tests");
-
-        let input = serde_json::json!({"command": "cd /tmp && git push"});
-        assert_eq!(
-            summarize_tool_action("Bash", Some(&input)),
-            "Pushing to remote"
-        );
-    }
+    // Fallback: split exactly at the target character boundary (byte-safe).
+    target_byte
 }

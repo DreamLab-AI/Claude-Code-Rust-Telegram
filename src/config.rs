@@ -1,298 +1,10 @@
 use crate::error::{AppError, Result};
 use serde::{Deserialize, Serialize};
-use std::env;
+use std::fmt;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct Config {
-    pub bot_token: String,
-    pub chat_id: i64,
-    pub enabled: bool,
-    pub verbose: bool,
-    pub approvals: bool,
-    pub socket_path: PathBuf,
-    pub use_threads: bool,
-    pub chunk_size: usize,
-    pub rate_limit: u32,
-    pub session_timeout: u64,
-    pub stale_session_timeout_hours: u64,
-    pub auto_delete_topics: bool,
-    pub topic_delete_delay_minutes: u64,
-    pub config_dir: PathBuf,
-    pub llm_summarize_url: Option<String>,
-    pub llm_api_key: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct ConfigFile {
-    #[serde(alias = "botToken", alias = "bot_token")]
-    bot_token: Option<String>,
-    #[serde(alias = "chatId", alias = "chat_id")]
-    chat_id: Option<i64>,
-    enabled: Option<bool>,
-    verbose: Option<bool>,
-    approvals: Option<bool>,
-    #[serde(alias = "socketPath", alias = "socket_path")]
-    socket_path: Option<String>,
-    #[serde(alias = "useThreads", alias = "use_threads")]
-    use_threads: Option<bool>,
-    #[serde(alias = "chunkSize", alias = "chunk_size")]
-    chunk_size: Option<usize>,
-    #[serde(alias = "rateLimit", alias = "rate_limit")]
-    rate_limit: Option<u32>,
-    #[serde(alias = "sessionTimeout", alias = "session_timeout")]
-    session_timeout: Option<u64>,
-    #[serde(
-        alias = "staleSessionTimeoutHours",
-        alias = "stale_session_timeout_hours"
-    )]
-    stale_session_timeout_hours: Option<u64>,
-    #[serde(alias = "autoDeleteTopics", alias = "auto_delete_topics")]
-    auto_delete_topics: Option<bool>,
-    #[serde(
-        alias = "topicDeleteDelayMinutes",
-        alias = "topic_delete_delay_minutes"
-    )]
-    topic_delete_delay_minutes: Option<u64>,
-    #[serde(alias = "llmSummarizeUrl", alias = "llm_summarize_url")]
-    llm_summarize_url: Option<String>,
-    #[serde(alias = "llmApiKey", alias = "llm_api_key")]
-    llm_api_key: Option<String>,
-}
-
-fn config_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| AppError::Config("Cannot determine home directory".to_string()))?;
-    Ok(home.join(".config").join("claude-telegram-mirror"))
-}
-
-/// Ensure config directory exists with secure permissions (0o700)
-pub fn ensure_config_dir(dir: &Path) -> Result<()> {
-    if !dir.exists() {
-        fs::create_dir_all(dir)?;
-    }
-    // Security fix #6: config dir chmod 0o700
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-/// Load config file from disk with permission validation
-fn load_config_file(config_dir: &Path) -> ConfigFile {
-    let config_path = config_dir.join("config.json");
-    if !config_path.exists() {
-        return ConfigFile::default();
-    }
-
-    // Check file permissions before reading
-    if let Ok(meta) = fs::metadata(&config_path) {
-        let mode = meta.permissions().mode() & 0o777;
-        if mode & 0o077 != 0 {
-            tracing::warn!(
-                "Config file has insecure permissions ({:o}), fixing to 0o600",
-                mode
-            );
-            let _ = fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600));
-        }
-    }
-
-    match fs::read_to_string(&config_path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
-            tracing::warn!("Failed to parse config file: {}", e);
-            ConfigFile::default()
-        }),
-        Err(e) => {
-            tracing::warn!("Failed to read config file: {}", e);
-            ConfigFile::default()
-        }
-    }
-}
-
-fn env_bool(key: &str, default: bool) -> bool {
-    match env::var(key) {
-        Ok(v) => v == "true" || v == "1",
-        Err(_) => default,
-    }
-}
-
-fn env_u64(key: &str, default: u64) -> u64 {
-    env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_u32(key: &str, default: u32) -> u32 {
-    env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_usize(key: &str, default: usize) -> usize {
-    env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-/// Load configuration: env vars > config file > defaults
-pub fn load_config(require_auth: bool) -> Result<Config> {
-    let dir = config_dir()?;
-    ensure_config_dir(&dir)?;
-
-    let file = load_config_file(&dir);
-    let default_socket = dir.join("bridge.sock");
-
-    let bot_token = env::var("TELEGRAM_BOT_TOKEN")
-        .ok()
-        .or(file.bot_token)
-        .unwrap_or_default();
-
-    let chat_id_str = env::var("TELEGRAM_CHAT_ID")
-        .ok()
-        .or_else(|| file.chat_id.map(|id| id.to_string()))
-        .unwrap_or_default();
-
-    let chat_id: i64 = if chat_id_str.is_empty() {
-        0
-    } else {
-        chat_id_str.parse().map_err(|_| {
-            AppError::Config(format!(
-                "TELEGRAM_CHAT_ID '{}' is not a valid integer.\n\
-                 Chat IDs for supergroups start with -100.",
-                chat_id_str
-            ))
-        })?
-    };
-
-    if require_auth {
-        if bot_token.is_empty() {
-            return Err(AppError::Config(
-                "TELEGRAM_BOT_TOKEN is required.\n\
-                 Get one from @BotFather on Telegram and set:\n  \
-                 export TELEGRAM_BOT_TOKEN=\"your-token-here\""
-                    .to_string(),
-            ));
-        }
-        if chat_id == 0 {
-            return Err(AppError::Config(
-                "TELEGRAM_CHAT_ID is required.\n\
-                 Get your chat ID by messaging your bot and visiting:\n  \
-                 https://api.telegram.org/bot<TOKEN>/getUpdates\n\
-                 Then set:\n  \
-                 export TELEGRAM_CHAT_ID=\"your-chat-id\""
-                    .to_string(),
-            ));
-        }
-    }
-
-    // MED-02: Validate socket path from env var to prevent path traversal
-    let socket_path = env::var("TELEGRAM_BRIDGE_SOCKET")
-        .ok()
-        .or(file.socket_path)
-        .map(|s| {
-            if s.contains("..") {
-                tracing::warn!(path = %s, "Socket path contains '..', using default");
-                return default_socket.clone();
-            }
-            let p = PathBuf::from(&s);
-            if !p.is_absolute() {
-                tracing::warn!(path = %s, "Socket path is not absolute, using default");
-                return default_socket.clone();
-            }
-            p
-        })
-        .unwrap_or(default_socket);
-
-    Ok(Config {
-        bot_token,
-        chat_id,
-        enabled: env_bool("TELEGRAM_MIRROR", file.enabled.unwrap_or(false)),
-        verbose: env_bool("TELEGRAM_MIRROR_VERBOSE", file.verbose.unwrap_or(true)),
-        approvals: env_bool("TELEGRAM_MIRROR_APPROVALS", file.approvals.unwrap_or(true)),
-        socket_path,
-        use_threads: env_bool("TELEGRAM_USE_THREADS", file.use_threads.unwrap_or(true)),
-        chunk_size: env_usize("TELEGRAM_CHUNK_SIZE", file.chunk_size.unwrap_or(4000)),
-        rate_limit: env_u32("TELEGRAM_RATE_LIMIT", file.rate_limit.unwrap_or(1)),
-        session_timeout: env_u64(
-            "TELEGRAM_SESSION_TIMEOUT",
-            file.session_timeout.unwrap_or(30),
-        ),
-        stale_session_timeout_hours: env_u64(
-            "TELEGRAM_STALE_SESSION_TIMEOUT_HOURS",
-            file.stale_session_timeout_hours.unwrap_or(72),
-        ),
-        auto_delete_topics: env_bool(
-            "TELEGRAM_AUTO_DELETE_TOPICS",
-            file.auto_delete_topics.unwrap_or(true),
-        ),
-        topic_delete_delay_minutes: env_u64(
-            "TELEGRAM_TOPIC_DELETE_DELAY_MINUTES",
-            file.topic_delete_delay_minutes.unwrap_or(1440),
-        ),
-        config_dir: dir,
-        llm_summarize_url: env::var("CTM_LLM_SUMMARIZE_URL")
-            .ok()
-            .or(file.llm_summarize_url),
-        llm_api_key: env::var("CTM_LLM_API_KEY").ok().or(file.llm_api_key),
-    })
-}
-
-/// Save config to file with secure permissions (0o600)
-#[allow(dead_code)]
-pub fn save_config(config: &Config) -> Result<()> {
-    ensure_config_dir(&config.config_dir)?;
-
-    let config_path = config.config_dir.join("config.json");
-    let file_config = serde_json::json!({
-        "botToken": config.bot_token,
-        "chatId": config.chat_id,
-        "enabled": config.enabled,
-        "verbose": config.verbose,
-        "approvals": config.approvals,
-        "useThreads": config.use_threads,
-        "autoDeleteTopics": config.auto_delete_topics,
-        "topicDeleteDelayMinutes": config.topic_delete_delay_minutes,
-    });
-
-    let content = serde_json::to_string_pretty(&file_config)
-        .map_err(|e| AppError::Config(format!("Failed to serialize config: {}", e)))?;
-
-    // Security fix #3: Write with 0o600 permissions
-    fs::write(&config_path, &content)?;
-    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))?;
-
-    Ok(())
-}
-
-/// Validate configuration
-pub fn validate_config(config: &Config) -> (Vec<String>, Vec<String>) {
-    let mut errors = Vec::new();
-    let mut warnings = Vec::new();
-
-    if config.bot_token.is_empty() {
-        errors.push("TELEGRAM_BOT_TOKEN is not set".to_string());
-    }
-    if config.chat_id == 0 {
-        errors.push("TELEGRAM_CHAT_ID is not set".to_string());
-    }
-    if !config.enabled {
-        warnings.push("TELEGRAM_MIRROR is not enabled".to_string());
-    }
-    if config.chunk_size < 1000 || config.chunk_size > 4096 {
-        warnings.push(format!(
-            "Chunk size {} may cause issues (recommended: 1000-4096)",
-            config.chunk_size
-        ));
-    }
-
-    (errors, warnings)
-}
-
-// ============ Mirror Status (runtime toggle state) ============
+// ---------------------------------------------------------------- mirror status
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MirrorStatus {
@@ -302,15 +14,15 @@ pub struct MirrorStatus {
     pub toggled_at: String,
 }
 
-pub fn status_file_path(config_dir: &Path) -> PathBuf {
+pub fn status_file_path(config_dir: &std::path::Path) -> std::path::PathBuf {
     config_dir.join("status.json")
 }
 
 /// Read the current mirroring enabled state from status.json.
 /// Returns `true` (default) if the file doesn't exist or can't be parsed.
-pub fn read_mirror_status(config_dir: &Path) -> bool {
+pub fn read_mirror_status(config_dir: &std::path::Path) -> bool {
     let path = status_file_path(config_dir);
-    match fs::read_to_string(&path) {
+    match std::fs::read_to_string(&path) {
         Ok(content) => serde_json::from_str::<MirrorStatus>(&content)
             .map(|s| s.enabled)
             .unwrap_or(true),
@@ -319,17 +31,437 @@ pub fn read_mirror_status(config_dir: &Path) -> bool {
 }
 
 /// Write the mirroring status file with secure permissions (0o600).
-pub fn write_mirror_status(config_dir: &Path, enabled: bool, pid: Option<u32>) {
+pub fn write_mirror_status(config_dir: &std::path::Path, enabled: bool, pid: Option<u32>) {
     let status = MirrorStatus {
         enabled,
         pid,
         toggled_at: chrono::Utc::now().to_rfc3339(),
     };
     let path = status_file_path(config_dir);
-    if let Ok(json) = serde_json::to_string_pretty(&status) {
-        let _ = fs::write(&path, &json);
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    let json = match serde_json::to_string_pretty(&status) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to serialize mirror status");
+            return;
+        }
+    };
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            if let Err(e) = file.write_all(json.as_bytes()) {
+                tracing::warn!(path = %path.display(), error = %e, "Failed to write mirror status");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "Failed to open mirror status file");
+        }
     }
+}
+
+/// CTM configuration loaded from env vars > config file > defaults
+#[derive(Clone)]
+pub struct Config {
+    pub bot_token: String,
+    pub chat_id: i64,
+    pub enabled: bool,
+    pub verbose: bool,
+    #[allow(dead_code)] // Library API
+    pub approvals: bool,
+    pub use_threads: bool,
+    pub chunk_size: usize,
+    pub rate_limit: u32,
+    pub session_timeout: u32,
+    #[allow(dead_code)] // Library API
+    pub stale_session_timeout_hours: u32,
+    pub auto_delete_topics: bool,
+    pub topic_delete_delay_minutes: u32,
+    /// ADR-013 E2: Inactivity threshold for topic deletion (default: 720 = 12 hours).
+    pub inactivity_delete_threshold_minutes: u32,
+    pub socket_path: PathBuf,
+    pub config_dir: PathBuf,
+    /// Resolved path to config.json (may not exist if config was provided via env vars only)
+    #[allow(dead_code)] // Library API
+    pub config_path: PathBuf,
+    /// Whether forum (topics) mode is enabled (default: false)
+    #[allow(dead_code)] // Library API
+    pub forum_enabled: bool,
+    /// Optional LLM endpoint for enhanced tool summaries (e.g. Z.AI or Anthropic)
+    pub llm_summarize_url: Option<String>,
+    /// Optional API key for the LLM endpoint
+    pub llm_api_key: Option<String>,
+}
+
+/// S-4: Manual Debug impl that redacts bot_token to prevent accidental log exposure.
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("bot_token", &"[REDACTED]")
+            .field("chat_id", &self.chat_id)
+            .field("enabled", &self.enabled)
+            .field("verbose", &self.verbose)
+            .field("approvals", &self.approvals)
+            .field("use_threads", &self.use_threads)
+            .field("chunk_size", &self.chunk_size)
+            .field("rate_limit", &self.rate_limit)
+            .field("session_timeout", &self.session_timeout)
+            .field(
+                "stale_session_timeout_hours",
+                &self.stale_session_timeout_hours,
+            )
+            .field("auto_delete_topics", &self.auto_delete_topics)
+            .field(
+                "topic_delete_delay_minutes",
+                &self.topic_delete_delay_minutes,
+            )
+            .field(
+                "inactivity_delete_threshold_minutes",
+                &self.inactivity_delete_threshold_minutes,
+            )
+            .field("socket_path", &self.socket_path)
+            .field("config_dir", &self.config_dir)
+            .field("config_path", &self.config_path)
+            .field("forum_enabled", &self.forum_enabled)
+            .field("llm_summarize_url", &self.llm_summarize_url)
+            .field("llm_api_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Config file structure (supports both camelCase and snake_case)
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct ConfigFile {
+    #[serde(alias = "botToken", alias = "bot_token")]
+    bot_token: Option<String>,
+    #[serde(alias = "chatId", alias = "chat_id")]
+    chat_id: Option<i64>,
+    #[serde(alias = "enabled")]
+    enabled: Option<bool>,
+    #[serde(alias = "verbose")]
+    verbose: Option<bool>,
+    #[serde(alias = "approvals")]
+    approvals: Option<bool>,
+    #[serde(alias = "useThreads", alias = "use_threads")]
+    use_threads: Option<bool>,
+    #[serde(alias = "chunkSize", alias = "chunk_size")]
+    chunk_size: Option<usize>,
+    #[serde(alias = "rateLimit", alias = "rate_limit")]
+    rate_limit: Option<u32>,
+    #[serde(alias = "sessionTimeout", alias = "session_timeout")]
+    session_timeout: Option<u32>,
+    #[serde(
+        alias = "staleSessionTimeoutHours",
+        alias = "stale_session_timeout_hours"
+    )]
+    stale_session_timeout_hours: Option<u32>,
+    #[serde(alias = "autoDeleteTopics", alias = "auto_delete_topics")]
+    auto_delete_topics: Option<bool>,
+    #[serde(
+        alias = "topicDeleteDelayMinutes",
+        alias = "topic_delete_delay_minutes"
+    )]
+    topic_delete_delay_minutes: Option<u32>,
+    #[serde(
+        alias = "inactivityDeleteThresholdMinutes",
+        alias = "inactivity_delete_threshold_minutes"
+    )]
+    inactivity_delete_threshold_minutes: Option<u32>,
+    #[serde(alias = "socketPath", alias = "socket_path")]
+    socket_path: Option<String>,
+    #[serde(alias = "llmSummarizeUrl", alias = "llm_summarize_url")]
+    llm_summarize_url: Option<String>,
+    #[serde(alias = "llmApiKey", alias = "llm_api_key")]
+    llm_api_key: Option<String>,
+}
+
+/// Fast-path check: is Telegram mirroring enabled based on env vars alone?
+///
+/// Returns `true` only when all three environment variables are set:
+/// `TELEGRAM_MIRROR` is `"true"` or `"1"`, `TELEGRAM_BOT_TOKEN` is non-empty,
+/// and `TELEGRAM_CHAT_ID` is non-empty. This avoids loading config files for
+/// callers that just need a quick guard.
+#[allow(dead_code)] // Library API
+pub fn is_mirror_enabled() -> bool {
+    std::env::var("TELEGRAM_MIRROR")
+        .ok()
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+        && std::env::var("TELEGRAM_BOT_TOKEN")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+        && std::env::var("TELEGRAM_CHAT_ID")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+}
+
+/// Get the user's home directory, falling back to /tmp if unavailable.
+///
+/// # Examples
+///
+/// ```
+/// use ctm::config::home_dir;
+///
+/// let dir = home_dir();
+/// // The returned path is always absolute.
+/// assert!(dir.is_absolute());
+/// ```
+pub fn home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+/// Get the config directory path
+pub fn get_config_dir() -> PathBuf {
+    home_dir().join(".config").join("claude-telegram-mirror")
+}
+
+/// Ensure config directory exists with secure permissions (0o700)
+pub fn ensure_config_dir(dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !dir.exists() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+/// Validate a socket path for safety.
+///
+/// The length limit of 104 bytes matches the AF_UNIX `sun_path` field size on
+/// Linux (108 minus the leading byte and null terminator). Paths longer than
+/// this will fail at `bind(2)` with ENAMETOOLONG.
+pub fn validate_socket_path(path: &str) -> bool {
+    !path.is_empty() && !path.contains("..") && path.starts_with('/') && path.len() <= 104
+}
+
+fn parse_bool(val: &str) -> bool {
+    matches!(val.trim().to_lowercase().as_str(), "true" | "1")
+}
+
+fn parse_u32(val: &str, default: u32) -> u32 {
+    val.trim().parse().unwrap_or_else(|_| {
+        tracing::warn!(value = val, default, "Invalid u32, using default");
+        default
+    })
+}
+
+fn parse_usize(val: &str, default: usize) -> usize {
+    val.trim().parse().unwrap_or_else(|_| {
+        tracing::warn!(value = val, default, "Invalid usize, using default");
+        default
+    })
+}
+
+fn parse_i64(val: &str, default: i64) -> i64 {
+    val.trim().parse().unwrap_or_else(|_| {
+        tracing::warn!(value = val, default, "Invalid i64, using default");
+        default
+    })
+}
+
+/// Load configuration with priority: env vars > config file > defaults
+pub fn load_config(require_auth: bool) -> Result<Config> {
+    let config_dir = get_config_dir();
+    let config_path = config_dir.join("config.json");
+    let default_socket = config_dir.join("bridge.sock");
+
+    // Load config file (if exists)
+    let file_config = if config_path.exists() {
+        match fs::read_to_string(&config_path) {
+            Ok(content) => match serde_json::from_str::<ConfigFile>(&content) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %config_path.display(),
+                        error = %e,
+                        "Failed to parse config file as JSON, using defaults"
+                    );
+                    ConfigFile::default()
+                }
+            },
+            Err(e) => {
+                tracing::warn!(path = %config_path.display(), error = %e, "Failed to read config file, using defaults");
+                ConfigFile::default()
+            }
+        }
+    } else {
+        ConfigFile::default()
+    };
+
+    // Priority: env > file > default
+    let bot_token = std::env::var("TELEGRAM_BOT_TOKEN")
+        .ok()
+        .or(file_config.bot_token)
+        .unwrap_or_default();
+
+    let chat_id = std::env::var("TELEGRAM_CHAT_ID")
+        .ok()
+        .map(|v| parse_i64(&v, 0))
+        .or(file_config.chat_id)
+        .unwrap_or(0);
+
+    let enabled = std::env::var("TELEGRAM_MIRROR")
+        .ok()
+        .map(|v| parse_bool(&v))
+        .or(file_config.enabled)
+        .unwrap_or(false);
+
+    let verbose = std::env::var("TELEGRAM_MIRROR_VERBOSE")
+        .ok()
+        .map(|v| parse_bool(&v))
+        .or(file_config.verbose)
+        .unwrap_or(true);
+
+    let approvals = std::env::var("TELEGRAM_MIRROR_APPROVALS")
+        .ok()
+        .map(|v| parse_bool(&v))
+        .or(file_config.approvals)
+        .unwrap_or(true);
+
+    let use_threads = std::env::var("TELEGRAM_USE_THREADS")
+        .ok()
+        .map(|v| parse_bool(&v))
+        .or(file_config.use_threads)
+        .unwrap_or(true);
+
+    let chunk_size = std::env::var("TELEGRAM_CHUNK_SIZE")
+        .ok()
+        .map(|v| parse_usize(&v, 4000))
+        .or(file_config.chunk_size)
+        .unwrap_or(4000);
+
+    let rate_limit = std::env::var("TELEGRAM_RATE_LIMIT")
+        .ok()
+        .map(|v| parse_u32(&v, 20))
+        .or(file_config.rate_limit)
+        .unwrap_or(20);
+
+    let session_timeout = std::env::var("TELEGRAM_SESSION_TIMEOUT")
+        .ok()
+        .map(|v| parse_u32(&v, 30))
+        .or(file_config.session_timeout)
+        .unwrap_or(30);
+
+    let stale_session_timeout_hours = std::env::var("TELEGRAM_STALE_SESSION_TIMEOUT_HOURS")
+        .ok()
+        .map(|v| parse_u32(&v, 72))
+        .or(file_config.stale_session_timeout_hours)
+        .unwrap_or(72);
+
+    let auto_delete_topics = std::env::var("TELEGRAM_AUTO_DELETE_TOPICS")
+        .ok()
+        .map(|v| parse_bool(&v))
+        .or(file_config.auto_delete_topics)
+        .unwrap_or(true);
+
+    let topic_delete_delay_minutes = std::env::var("TELEGRAM_TOPIC_DELETE_DELAY_MINUTES")
+        .ok()
+        .map(|v| parse_u32(&v, 15))
+        .or(file_config.topic_delete_delay_minutes)
+        .unwrap_or(15);
+
+    let inactivity_delete_threshold_minutes =
+        std::env::var("TELEGRAM_INACTIVITY_DELETE_THRESHOLD_MINUTES")
+            .ok()
+            .map(|v| parse_u32(&v, 720))
+            .or(file_config.inactivity_delete_threshold_minutes)
+            .unwrap_or(720);
+
+    // Socket path with validation
+    let socket_path = std::env::var("TELEGRAM_BRIDGE_SOCKET")
+        .ok()
+        .or(file_config.socket_path)
+        .and_then(|p| {
+            if validate_socket_path(&p) {
+                Some(PathBuf::from(p))
+            } else {
+                tracing::warn!(path = %p, "Invalid socket path, using default");
+                None
+            }
+        })
+        .unwrap_or(default_socket);
+
+    // LLM summarization (optional)
+    let llm_summarize_url = std::env::var("CTM_LLM_SUMMARIZE_URL")
+        .ok()
+        .or(file_config.llm_summarize_url)
+        .filter(|v| !v.is_empty());
+
+    let llm_api_key = std::env::var("CTM_LLM_API_KEY")
+        .ok()
+        .or(file_config.llm_api_key)
+        .filter(|v| !v.is_empty());
+
+    if require_auth {
+        if bot_token.is_empty() {
+            return Err(AppError::Config(
+                "TELEGRAM_BOT_TOKEN is required. Create a bot via @BotFather (https://t.me/botfather) and paste the token.".into(),
+            ));
+        }
+        if chat_id == 0 {
+            return Err(AppError::Config(
+                "TELEGRAM_CHAT_ID is required. Get your chat ID from https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates after sending a message in your group. Supergroup IDs start with -100.".into(),
+            ));
+        }
+    }
+
+    Ok(Config {
+        bot_token,
+        chat_id,
+        enabled,
+        verbose,
+        approvals,
+        use_threads,
+        chunk_size,
+        rate_limit,
+        session_timeout,
+        stale_session_timeout_hours,
+        auto_delete_topics,
+        topic_delete_delay_minutes,
+        inactivity_delete_threshold_minutes,
+        socket_path,
+        config_dir,
+        config_path,
+        forum_enabled: false,
+        llm_summarize_url,
+        llm_api_key,
+    })
+}
+
+/// Validate a loaded Config and return (errors, warnings).
+///
+/// Returns `(errors, warnings)` where errors are fatal misconfigurations
+/// and warnings are non-fatal but potentially problematic settings.
+pub fn validate_config(config: &Config) -> (Vec<String>, Vec<String>) {
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+
+    if config.bot_token.is_empty() {
+        errors.push("TELEGRAM_BOT_TOKEN is not set".into());
+    }
+    if config.chat_id == 0 {
+        errors.push("TELEGRAM_CHAT_ID is not set".into());
+    }
+    if !config.enabled {
+        warnings.push("TELEGRAM_MIRROR is not enabled (set to true)".into());
+    }
+    if config.chunk_size < 1000 || config.chunk_size > 4096 {
+        warnings.push(format!(
+            "TELEGRAM_CHUNK_SIZE ({}) is outside recommended range (1000-4096)",
+            config.chunk_size
+        ));
+    }
+
+    (errors, warnings)
 }
 
 #[cfg(test)]
@@ -337,15 +469,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_env_bool() {
-        assert!(env_bool("NONEXISTENT_VAR_12345", true));
-        assert!(!env_bool("NONEXISTENT_VAR_12345", false));
+    fn test_validate_socket_path() {
+        assert!(validate_socket_path("/tmp/bridge.sock"));
+        assert!(validate_socket_path("/home/user/.config/ctm/bridge.sock"));
+        assert!(!validate_socket_path(""));
+        assert!(!validate_socket_path("relative/path.sock"));
+        assert!(!validate_socket_path("/tmp/../etc/evil.sock"));
+        assert!(!validate_socket_path(&format!("/{}", "a".repeat(104))));
     }
 
     #[test]
-    fn test_config_file_default() {
-        let file = ConfigFile::default();
-        assert!(file.bot_token.is_none());
-        assert!(file.chat_id.is_none());
+    fn test_parse_bool() {
+        assert!(parse_bool("true"));
+        assert!(parse_bool("1"));
+        assert!(parse_bool("TRUE"));
+        assert!(!parse_bool("false"));
+        assert!(!parse_bool("0"));
+        assert!(!parse_bool("anything"));
+    }
+
+    #[test]
+    fn test_read_mirror_status_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(read_mirror_status(tmp.path()));
+    }
+
+    #[test]
+    fn test_mirror_status_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_mirror_status(tmp.path(), false, Some(1234));
+        assert!(!read_mirror_status(tmp.path()));
+        write_mirror_status(tmp.path(), true, None);
+        assert!(read_mirror_status(tmp.path()));
+    }
+
+    #[test]
+    fn test_read_mirror_status_corrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("status.json"), "not json").unwrap();
+        assert!(read_mirror_status(tmp.path()));
+    }
+
+    #[test]
+    fn test_defaults() {
+        // Clear env vars that might interfere
+        std::env::remove_var("TELEGRAM_BOT_TOKEN");
+        std::env::remove_var("TELEGRAM_CHAT_ID");
+
+        let config = load_config(false).unwrap();
+        assert!(config.verbose);
+        assert!(config.approvals);
+        assert!(config.use_threads);
+        assert_eq!(config.chunk_size, 4000);
+        assert_eq!(config.rate_limit, 20);
+        assert_eq!(config.session_timeout, 30);
+        assert_eq!(config.stale_session_timeout_hours, 72);
+        assert!(config.auto_delete_topics);
+        assert_eq!(config.topic_delete_delay_minutes, 15);
+        assert_eq!(config.inactivity_delete_threshold_minutes, 720);
     }
 }
