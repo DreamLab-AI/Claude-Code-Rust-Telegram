@@ -4,8 +4,12 @@
 //! Downstream Rust consumers can depend on this crate and access any public
 //! module, e.g. `use ctm::session::SessionManager`.
 
+pub mod agentbox_config;
 pub mod bot;
 pub mod colors;
+pub mod cost;
+pub mod identity;
+pub mod subprocess;
 pub mod config;
 pub mod daemon;
 pub mod doctor;

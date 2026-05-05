@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/Tests-23%20passing-green.svg)]()
+[![Tests](https://img.shields.io/badge/Tests-153%20passing-green.svg)]()
 [![Clippy](https://img.shields.io/badge/Clippy-0%20warnings-green.svg)]()
 
 Monitor and control Claude Code from your phone. CTM is a Rust daemon that bridges Claude Code CLI sessions to Telegram, giving you a real-time mobile interface to what Claude is doing.
@@ -251,6 +251,49 @@ Environment variables override config file values.
 | `llm_summarize_url` | string | none | LLM endpoint for summary fallback |
 | `llm_api_key` | string | none | API key for LLM endpoint |
 
+## Agentbox Integration
+
+CTM integrates with the [agentbox](https://github.com/DreamLab-AI/agentbox) adapter architecture as an **events adapter**. When running inside agentbox, configuration is loaded from `agentbox.toml` instead of `config.json`.
+
+### agentbox.toml Configuration
+
+```toml
+[sovereign_mesh]
+telegram_mirror = true
+
+[sovereign_mesh.operator]
+pubkey_hex = "11ed64225dd5e2c5e18f61ad43d5ad9272d08739d3a20dd25886197b0738663c"
+
+[sovereign_mesh.telegram]
+chat_id = -1001234567890
+default_model = "sonnet"
+max_workers = 5
+notification_mode = "live"      # live | summary | quiet
+
+# Multi-user identity mapping (DID:nostr -> Telegram)
+[[sovereign_mesh.telegram.allowed_users]]
+pubkey_hex = "aabbccdd..."       # 64-char hex secp256k1 pubkey
+telegram_id = 12345
+role = "admin"                   # admin | user
+label = "John"
+```
+
+The bot token is **never** stored in TOML — set `TELEGRAM_BOT_TOKEN` as an environment variable. The operator pubkey from `[sovereign_mesh.operator]` is auto-granted admin role.
+
+**Config priority:** env vars > agentbox.toml > legacy config.json > defaults.
+
+### DID:nostr Identity
+
+Users are identified by their `did:nostr:<hex-pubkey>` identity, mapped to Telegram user IDs in SQLite. The identity store supports:
+- Operator bootstrap from `[sovereign_mesh.operator]`
+- User seeding from `[[sovereign_mesh.telegram.allowed_users]]`
+- Runtime provisioning via `/adduser` and `/removeuser` bot commands
+- Admin/user RBAC with per-user authorization checks
+
+### Cost Tracking
+
+Per-session, per-user, and per-group cost tracking with configurable budget enforcement. Costs are recorded automatically from Claude CLI's `stream-json` output.
+
 ## Multi-Machine Setup
 
 Run CTM on multiple machines with a shared Telegram group:
@@ -261,42 +304,40 @@ Run CTM on multiple machines with a shared Telegram group:
 
 ## Architecture
 
-```
-┌─────────────┐     hooks      ┌─────────────┐    NDJSON     ┌─────────────┐
-│ Claude Code │───(stdin/out)──│  ctm hook   │───(socket)───│   Bridge    │
-│   (tmux)    │                └─────────────┘               │   Daemon    │
-│             │◄──(send-keys)──────────────────────────────│             │
-└─────────────┘                                              │  ┌───────┐ │
-                                                             │  │  Bot  │ │
-┌─────────────┐                                              │  │(telo- │ │
-│  Sessions   │◄────────(SQLite)──────────────────────────│  │ xide) │ │
-│    (.db)    │                                              │  └───┬───┘ │
-└─────────────┘                                              └─────┼─────┘
-                                                                   │
-                                                          Telegram API
-                                                                   │
-                                                             ┌─────┴─────┐
-                                                             │ Telegram  │
-                                                             │   Group   │
-                                                             │ (Topics)  │
-                                                             └───────────┘
+```mermaid
+graph LR
+    CC[Claude Code] -->|hooks stdin/stdout| Hook[ctm hook]
+    Hook -->|NDJSON socket| Daemon[Bridge Daemon]
+    CC -->|subprocess mgmt| Sub[SubprocessManager]
+    Sub -->|stream-json| Daemon
+    Daemon -->|Telegram API| TG[Telegram Group]
+    TG -->|user messages| Daemon
+    Daemon -->|SQLite| DB[(sessions.db<br/>identity.db<br/>costs.db)]
+    TOML[agentbox.toml] -->|config| Daemon
+    ENV[env vars] -->|override| Daemon
 ```
 
 ### Modules
 
 | Module | Lines | Responsibility |
 |--------|-------|---------------|
-| `bridge.rs` | ~1500 | Central orchestrator: routes messages between all components |
-| `bot.rs` | ~400 | Telegram API: send/receive, forums, inline keyboards, file transfer, rate limiting |
-| `socket.rs` | ~250 | Unix socket server with flock PID locking, NDJSON protocol |
-| `session.rs` | ~250 | SQLite persistence: sessions, approvals, stale cleanup |
-| `formatting.rs` | ~700 | Tool summaries, message formatting, ANSI stripping, chunking |
-| `summarizer.rs` | ~150 | Optional LLM fallback for unknown tool summarization |
-| `hook.rs` | ~250 | Converts Claude Code hook events to bridge messages |
-| `injector.rs` | ~200 | Shell-safe tmux command injection via `Command::arg()` |
-| `config.rs` | ~300 | Config loading: env vars > file > defaults, permission enforcement |
-| `types.rs` | ~200 | Shared types: BridgeMessage, HookEvent, Session, enums |
-| `error.rs` | ~50 | Error types via thiserror |
+| `daemon/` | ~4500 | Central orchestrator: event loop, socket/Telegram/callback handlers, cleanup |
+| `bot/` | ~2200 | Telegram API: AIMD rate control, priority queue, retry logic, file transfer |
+| `agentbox_config.rs` | ~350 | agentbox.toml parser: `[sovereign_mesh.telegram]` section loader |
+| `identity.rs` | ~350 | DID:nostr identity store: pubkey-to-Telegram mapping, RBAC |
+| `cost.rs` | ~250 | Cost tracking: per-session/user/group, budget enforcement |
+| `subprocess.rs` | ~350 | Direct Claude CLI subprocess manager (replaces tmux send-keys) |
+| `session.rs` | ~950 | SQLite persistence: sessions, approvals, parent-child, stale cleanup |
+| `config.rs` | ~530 | Legacy config loading: env vars > config.json > defaults |
+| `hook.rs` | ~950 | Claude Code hook event processing (8 event types) |
+| `formatting.rs` | ~670 | Tool summaries, message formatting, ANSI stripping, chunking |
+| `types.rs` | ~840 | Shared types: BridgeMessage, HookEvent, Session, validation |
+| `injector.rs` | ~470 | Shell-safe tmux command injection (legacy, retained for compatibility) |
+| `summarize.rs` | ~470 | Rule-based tool action summaries |
+| `summarizer.rs` | ~210 | Optional LLM fallback for unknown tool summarization |
+| `socket.rs` | ~620 | Unix socket server with flock PID locking, NDJSON protocol |
+| `service/` | ~990 | systemd/launchd service management and installation |
+| `error.rs` | ~52 | Error types via thiserror |
 
 ## Troubleshooting
 
@@ -345,6 +386,13 @@ RUST_LOG=debug ctm start # Verbose logging
 | [ADR-004](docs/adr/ADR-004-flock-pid-locking.md) | flock(2) atomic PID locking |
 | [ADR-005](docs/adr/ADR-005-governor-rate-limiting.md) | governor token-bucket rate limiting |
 | [ADR-006](docs/adr/ADR-006-single-binary-clap.md) | Single binary with clap CLI |
+| [ADR-007](docs/adr/ADR-007-agentbox-adapter-integration.md) | Agentbox events adapter integration |
+
+### Domain Model
+
+| Document | Description |
+|----------|-------------|
+| [Bounded Context](docs/ddd/bounded-context-telegram-adapter.md) | DDD bounded context: entities, aggregates, domain events |
 
 ## License
 
